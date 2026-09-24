@@ -23,6 +23,9 @@ import type { JobDto, SegmentDto } from "@/lib/types";
 import { STAGE_META } from "@/lib/types";
 import { LANGUAGES, VOICES, voicesForLanguage, type DubVoice } from "@/lib/voices";
 
+/** Mirrors the extension allow-list enforced by /api/jobs. */
+const VIDEO_EXT = /\.(mp4|m4v|mov|mkv|webm|avi|mpg|mpeg|ts|m2ts|flv|wmv|3gp|mxf)$/i;
+
 /* ------------------------------- bits ------------------------------- */
 
 export function Kicker({ children }: { children: React.ReactNode }) {
@@ -74,7 +77,11 @@ export function Dropzone({
         setDrag(false);
         if (disabled) return;
         const f = e.dataTransfer.files?.[0];
-        if (f && f.type.startsWith("video/")) onFile(f);
+        // Browsers often report an empty MIME type for .mkv/.ts/.avi, so fall
+        // back to the extension before rejecting the drop.
+        const looksLikeVideo =
+          f && (f.type.startsWith("video/") || VIDEO_EXT.test(f.name));
+        if (f && looksLikeVideo) onFile(f);
       }}
       onClick={() => !disabled && inputRef.current?.click()}
       className={`group relative flex min-h-[19rem] cursor-pointer flex-col items-center justify-center gap-5 rounded-3xl border-2 border-dashed p-8 text-center transition-all duration-300 ${

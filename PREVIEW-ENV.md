@@ -14,11 +14,14 @@ known to work there.
 
 ```
 DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/app_db
-PYTHON_BIN=/home/user/venv/bin/python   # exported in the shell, not in .env
+FFMPEG_PATH=/home/user/bin/ffmpeg
+FFPROBE_PATH=/home/user/bin/ffprobe
+PYTHON_BIN=/home/user/venv/bin/python
 ```
 
-Optional keys the pipeline picks up when present: `GROQ_API_KEY` / `OPENAI_API_KEY`
-(translation), `WHISPER_MODEL` (default `base`), `DUB_DATA_DIR` (default `./data`).
+`.env` is gitignored; `.env.example` documents the same keys for other machines.
+Optional: `GROQ_API_KEY` / `OPENAI_API_KEY` (translation), `WHISPER_MODEL`
+(default `base`), `DUB_DATA_DIR` (default `./data`).
 
 ## How it was set up
 
@@ -40,16 +43,32 @@ Optional keys the pipeline picks up when present: `GROQ_API_KEY` / `OPENAI_API_K
    NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt npm install --ignore-scripts
    ```
 
-   Binaries are then taken from the registry-hosted `@ffmpeg-installer/linux-x64`
-   and `@ffprobe-installer/linux-x64` packages and copied to the paths
-   `src/lib/fftools.ts` expects:
+   Binaries come from the registry-hosted `@ffmpeg-installer/linux-x64` and
+   `@ffprobe-installer/linux-x64` packages and are copied to a stable location
+   outside `node_modules` (an `npm install` would prune a manual drop-in inside
+   the package folder). `src/lib/fftools.ts` honours `FFMPEG_PATH` / `FFPROBE_PATH`:
 
    ```bash
-   cp node_modules/@ffmpeg-installer/linux-x64/ffmpeg node_modules/ffmpeg-static/ffmpeg
-   cp node_modules/@ffprobe-installer/linux-x64/ffprobe node_modules/ffprobe-static/bin/linux/x64/ffprobe
+   cp node_modules/@ffmpeg-installer/linux-x64/ffmpeg /home/user/bin/ffmpeg
+   cp node_modules/@ffprobe-installer/linux-x64/ffprobe /home/user/bin/ffprobe
    ```
 
 3. **Python** — `/home/user/venv` with `faster-whisper` and `edge-tts`.
+
+## Proxied preview origin (important)
+
+The preview is served from `https://<port>-<sandboxId>.e2b.app`, not from
+localhost. Next.js blocks cross-origin dev resources by default, which returned
+**403 for every `/_next/static/chunks/*.js` request** and silently killed
+hydration — the page rendered but no button, file picker or upload worked.
+`next.config.ts` therefore allows the proxy origins:
+
+```ts
+allowedDevOrigins: ["*.e2b.app", "*.arena.ai", "*.host-ai.app", "localhost", "127.0.0.1"],
+```
+
+Fonts are self-hosted from the `@fontsource*` packages (`src/app/layout.tsx` uses
+`next/font/local`) because `fonts.googleapis.com` is unreachable.
 
 ## Sandbox network limits
 

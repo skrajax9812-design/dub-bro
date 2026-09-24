@@ -5,7 +5,11 @@ import fs from "fs";
 
 const req = createRequire(path.join(process.cwd(), "noop.js"));
 
-function resolveBin(pkg: string, relFallback: string): string {
+function resolveBin(pkg: string, relFallback: string, envVar: string): string {
+  // 1. Explicit override (e.g. a system ffmpeg installed outside node_modules)
+  const override = process.env[envVar];
+  if (override && fs.existsSync(override)) return override;
+  // 2. The npm package (works when its postinstall download succeeded)
   try {
     const p = req(pkg);
     const bin = typeof p === "string" ? p : (p as { path?: string }).path;
@@ -13,13 +17,14 @@ function resolveBin(pkg: string, relFallback: string): string {
   } catch {
     /* fall through */
   }
+  // 3. Manual drop-in inside the package folder
   const manual = path.join(process.cwd(), "node_modules", pkg, relFallback);
   if (fs.existsSync(manual)) return manual;
   return pkg; // hope it is on PATH
 }
 
-export const FFMPEG = resolveBin("ffmpeg-static", "ffmpeg");
-export const FFPROBE = resolveBin("ffprobe-static", "ffprobe");
+export const FFMPEG = resolveBin("ffmpeg-static", "ffmpeg", "FFMPEG_PATH");
+export const FFPROBE = resolveBin("ffprobe-static", "ffprobe", "FFPROBE_PATH");
 
 export interface RunResult {
   code: number;
