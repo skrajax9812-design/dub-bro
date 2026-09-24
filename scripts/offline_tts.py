@@ -176,6 +176,53 @@ def synth_kokoro(
         return None
 
 
+# ------------------------------------------------------------------ xtts (cloning)
+
+_xtts = None
+
+
+def xtts_ready(model_dir: str, reference: str) -> bool:
+    return bool(model_dir) and os.path.isdir(model_dir) and bool(reference) and os.path.exists(reference)
+
+
+def synth_xtts(
+    text: str, model_dir: str, reference: str, lang: str, speed: float, speaker: str = ""
+) -> tuple[np.ndarray, int] | None:
+    """
+    XTTS-v2 zero-shot clone: the reference clip is the speaker from the source
+    video, so the dubbed line comes out in that person's voice.
+    """
+    global _xtts
+    if not model_dir or not os.path.isdir(model_dir):
+        return None
+    if not reference and not speaker:
+        return None
+    try:
+        import torch
+        from TTS.api import TTS
+
+        if _xtts is None:
+            torch.set_num_threads(max(1, min(2, os.cpu_count() or 1)))
+            _xtts = TTS(
+                model_path=os.path.join(model_dir, "model.pth"),
+                config_path=os.path.join(model_dir, "config.json"),
+                progress_bar=False,
+            ).to("cpu")
+        sample_rate = int(getattr(_xtts.synthesizer, "output_sample_rate", 24000))
+        wav = _xtts.tts(
+            text=text,
+            speaker=speaker if (speaker and not reference) else None,
+            speaker_wav=reference or None,
+            language=lang,
+            speed=float(np.clip(speed, 0.7, 1.4)),
+            split_sentences=False,
+        )
+        return np.asarray(wav, dtype=np.float32), sample_rate
+    except Exception as e:
+        print(f"xtts failed ({e})", file=sys.stderr, flush=True)
+        return None
+
+
 # ------------------------------------------------------------------ analysis
 
 
@@ -245,6 +292,12 @@ class Engine:
 
     # -- rendering -----------------------------------------------------
     def render(self, text: str, lang: str, gender: str, wpm: int, speed: float, voice: str):
+        if self.name == "xtts":
+            out = synth_xtts(
+                text, self.opts.xtts_model, self.opts.reference, lang, speed, voice if not self.opts.reference else ""
+            )
+            if out is not None:
+                return out
         if self.name == "kokoro":
             out = synth_kokoro(text, self.opts.kokoro_model, self.opts.kokoro_voices, voice, speed)
             if out is not None:
@@ -261,6 +314,12 @@ class Engine:
         if self._calibrated.get(key):
             return
         self._calibrated[key] = True
+        if self.name == "xtts":
+            # The clone is already this speaker — pitch/EQ matching would only
+            # smear it. Report the match as satisfied and skip the shift.
+            self.matched = False
+            print("VOICEMATCH engine=xtts skipped — the clone carries the speaker's timbre", file=sys.stderr, flush=True)
+            return
         if not self.profile:
             return
         target_f0 = self.profile.get("f0Median")
@@ -277,7 +336,7 @@ class Engine:
         self.ratio = float(np.clip(target_f0 / tts_f0, 0.45, 1.8))
         t_off, s_off = float(np.mean(target_bands)), float(np.mean(tts_bands))
         self.gains = [
-            float(np.clip((target_bands[k] - t_off) - (tts_bands[k] - s_off), -8.0, 8.0))
+            float(np.clip((target_bands[k] - t_off) - (tts_bands[k] - s_off), -4.0, 4.0))
             for k in range(len(BANDS))
         ]
         self.matched = True
@@ -300,8 +359,10 @@ class Engine:
                 chain.append(f"aresample={src_sr}")
                 chain.append(f"atempo={1.0 / self.ratio:.5f}")
             for center, gain in zip(BAND_CENTERS, self.gains):
-                if abs(gain) > 0.75:
-                    chain.append(f"equalizer=f={center}:t=o:w=1:g={gain:.2f}")
+                if abs(gain) > 0.6:
+                    # Wide, gentle shelves: a hard ±8 dB EQ is what makes a matched
+                    # voice sound hollow/robotic.
+                    chain.append(f"equalizer=f={center}:t=o:w=1.6:g={gain:.2f}")
 
         # Fit the slot: pitch/EQ first, then measure, then compress if needed.
         base = [FFMPEG, "-y", "-v", "error", "-i", src_wav, "-ac", "1", "-ar", str(OUT_RATE)]
@@ -315,14 +376,22 @@ class Engine:
         duration = wav_duration(fitted)
         tempo = 1.0
         if slot_ms and duration > 0:
-            target = (slot_ms / 1000.0) * (1.0 + rate_pct / 100.0)
-            if duration > target * 1.04:
+            # MP3 encoding adds ~50-70 ms of padding, so aim a little short of the
+            # slot — otherwise the tail of one line bleeds over the next one.
+            target = max(0.4, (slot_ms / 1000.0) * (1.0 + rate_pct / 100.0) - 0.09)
+            if duration > target:
                 tempo = min(MAX_ATEMPO, duration / target)
         final = [FFMPEG, "-y", "-v", "error", "-i", fitted, "-ac", "1", "-ar", str(OUT_RATE)]
         post: list[str] = []
         if tempo > 1.01:
             post.append(f"atempo={tempo:.4f}")
-        post.append("loudnorm=I=-18:TP=-2:LRA=11")
+        # A single static gain keeps line-to-line loudness even without the
+        # pumping that per-clip dynamic normalisation causes. The finished track
+        # gets one proper loudnorm pass in the pipeline.
+        gain = static_gain_db(fitted)
+        if abs(gain) > 0.2:
+            post.append(f"volume={gain:.2f}dB")
+        post.append("alimiter=limit=0.95:attack=5:release=60")
         final += ["-af", ",".join(post), "-c:a", "libmp3lame", "-b:a", "128k", out_path]
         subprocess.run(final, check=True)
         for p in (fitted,):
@@ -330,6 +399,25 @@ class Engine:
                 os.unlink(p)
             except OSError:
                 pass
+
+
+def static_gain_db(path: str, target_dbfs: float = -6.0) -> float:
+    """One fixed gain per clip, measured from its peak (no dynamic pumping)."""
+    try:
+        out = subprocess.run(
+            [FFMPEG, "-v", "info", "-i", path, "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True,
+            text=True,
+        ).stderr
+        peak = None
+        for line in out.splitlines():
+            if "max_volume:" in line:
+                peak = float(line.split("max_volume:")[1].replace("dB", "").strip())
+        if peak is None:
+            return 0.0
+        return float(np.clip(target_dbfs - peak, -12.0, 14.0))
+    except Exception:
+        return 0.0
 
 
 def wav_rate(path: str) -> int:
@@ -363,6 +451,9 @@ def pick_engine(opts: argparse.Namespace, voice: str) -> str:
     forced = (opts.engine or "auto").lower()
     if forced != "auto":
         return forced
+    # Cloning beats everything else when the model and a speaker clip are present.
+    if opts.xtts_model and os.path.isdir(opts.xtts_model) and (opts.reference or voice):
+        return "xtts"
     if kokoro_ready(opts.kokoro_model, opts.kokoro_voices) and voice and voice[0] in "hab":
         return "kokoro"
     if piper_ready(opts.piper_model):
@@ -380,10 +471,12 @@ def main() -> None:
     ap.add_argument("--voice", default="")
     ap.add_argument("--rate", default="+0%")
     ap.add_argument("--profile", default="")
-    ap.add_argument("--engine", default="auto", choices=["auto", "kokoro", "piper", "espeak"])
+    ap.add_argument("--engine", default="auto", choices=["auto", "xtts", "kokoro", "piper", "espeak"])
     ap.add_argument("--piper-model", default="")
     ap.add_argument("--kokoro-model", default="")
     ap.add_argument("--kokoro-voices", default="")
+    ap.add_argument("--xtts-model", default="", help="directory with model.pth + config.json")
+    ap.add_argument("--reference", default="", help="speaker clip used by the cloning engine")
     ap.add_argument("--espeak-pitch", type=int, default=50)
     args = ap.parse_args()
 

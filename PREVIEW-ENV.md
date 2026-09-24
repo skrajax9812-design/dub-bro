@@ -3,6 +3,18 @@
 Notes on how this checkout is wired up to run inside the sandbox, plus what is
 known to work there.
 
+## Rebuilding after a sandbox reset
+
+Everything below is reproducible:
+
+```bash
+bash scripts/setup-sandbox.sh          # venv, ffmpeg, node deps, postgres, schema, .env
+npm run dev -- -H 0.0.0.0 -p 3000      # start the studio
+```
+
+Model weights live in `data/models` (gitignored) and are installed from the Studio in
+the browser — re-install them after a reset.
+
 ## Services
 
 | Service | How it runs | Port |
@@ -79,7 +91,7 @@ of the pipeline have offline paths:
 | --- | --- | --- |
 | Speech recognition | Faster-Whisper (downloads from HF) | model installed from the **Studio** → runs locally |
 | Translation | Groq / OpenAI / MyMemory (server) | the visitor's browser (CORS-enabled MT API) or manual edits in review |
-| Voice | Edge-TTS neural voice | Kokoro-82M → Piper → bundled espeak-ng |
+| Voice | Edge-TTS neural voice | **XTTS-v2 voice clone** → Kokoro-82M → Piper → espeak-ng |
 | Voice cloning | — | `scripts/voice_profile.py` + `scripts/offline_tts.py` match the dub's pitch and tone to the speaker in the source video |
 
 **Quality ladder.** The pipeline picks the best engine it can actually run:
@@ -122,6 +134,30 @@ raw espeak Hindi 210 Hz female → matched dub 97 Hz male.
 FFmpeg: the `@ffmpeg-installer/ffmpeg` build is from 2018 and lacks
 `amix=normalize`, so ffmpeg 7.0.2 is taken from the PyPI `imageio-ffmpeg` wheel
 (`/home/user/bin/ffmpeg`), with `FFPROBE_PATH` pointing at the installer build.
+
+## Voice cloning
+
+`XTTS-v2` (via `coqui-tts`) clones the speaker straight out of the video: during the
+extract stage `scripts/voice_profile.py --reference` picks the cleanest ~12 s of
+continuous speech (most speech energy, fewest internal pauses) and peak-normalises it.
+Every dubbed line is then synthesized with `speaker_wav=<that clip>`, so the output is
+in the voice of the person on screen.
+
+- `GET /api/models` reports `active.clone` and `active.engine`.
+- The pipeline prefers the clone whenever the model is installed and the language is
+  supported (XTTS speaks 17 languages, Hindi included).
+- Cloning runs on CPU, so `CLONE_MAX_SEC` (default 180 s) caps it: longer videos fall
+  back to the neural voice and the log says why.
+- Pitch/EQ matching is skipped for the clone (it would only smear an already-correct
+  timbre); it still runs for Piper/Kokoro/espeak.
+
+Timing: each line's budget is *the time until the next line starts* (not just its own
+spoken duration), and the TTS worker fits lines with the engine's native rate control
+first, then a small atempo correction, keeping a ~90 ms margin for MP3 encoder padding.
+Result: lines fit their slots instead of overlapping or sounding sped-up.
+
+Loudness: the assembled track is measured and lifted with a static gain + limiter to
+-18 LUFS / ≈-1 dBFS true peak (two-pass, no dynamic pumping).
 
 ## Sandbox network limits
 

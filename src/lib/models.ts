@@ -88,6 +88,21 @@ export const MODEL_PRESETS: ModelPreset[] = [
     ],
   },
   {
+    id: "xtts-v2",
+    kind: "tts",
+    label: "XTTS-v2 voice cloning (clones the speaker, ~1.9 GB)",
+    note:
+      "Zero-shot clone: the dub is spoken in the voice of the person in your video. " +
+      "Most natural result, but slow on CPU — best for clips up to a few minutes.",
+    files: [
+      hf("coqui/XTTS-v2", "config.json", "tts/xtts/config.json", 5_000),
+      hf("coqui/XTTS-v2", "model.pth", "tts/xtts/model.pth", 1_870_000_000),
+      hf("coqui/XTTS-v2", "vocab.json", "tts/xtts/vocab.json", 500_000),
+      hf("coqui/XTTS-v2", "speakers_xtts.pth", "tts/xtts/speakers_xtts.pth", 15_000_000),
+      hf("coqui/XTTS-v2", "mel_stats.pth", "tts/xtts/mel_stats.pth", 100_000),
+    ],
+  },
+  {
     id: "kokoro-hi",
     kind: "tts",
     label: "Kokoro-82M — Hindi voices (best quality, ~340 MB)",
@@ -249,4 +264,21 @@ export function findLocalPiperVoice(lang: string, gender: string): string | null
     gender === "F" ? /priyamvada|female/i.test(p) : /pratham|male/i.test(p),
   );
   return preferred ?? pool[0];
+}
+
+
+/** Local XTTS-v2 clone model (dir containing model.pth + config.json). */
+export function findLocalXtts(): string | null {
+  const dir = path.join(modelsRoot(), "tts", "xtts");
+  const model = path.join(dir, "model.pth");
+  const config = path.join(dir, "config.json");
+  if (fs.existsSync(model) && fs.existsSync(config)) return dir;
+  return null;
+}
+
+/** Languages XTTS-v2 can speak (its own code set, mostly ISO-639-1). */
+export function xttsSupports(lang: string): boolean {
+  return ["en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl", "cs", "ar", "zh", "ja", "hu", "ko", "hi"].includes(
+    lang,
+  );
 }

@@ -8,6 +8,7 @@ import {
   findLocalKokoro,
   findLocalPiperVoice,
   findLocalWhisperModel,
+  findLocalXtts,
   kokoroVoiceFor,
 } from "@/lib/models";
 
@@ -42,20 +43,23 @@ export async function POST(req: NextRequest) {
   if (kind === "tts") {
     const kokoro = findLocalKokoro();
     const piper = findLocalPiperVoice(lang, gender);
-    const engine = kokoro ? "kokoro" : piper ? "piper" : "espeak";
+    const xtts = findLocalXtts();
+    // Prefer the cloning engine so the test proves the clone actually speaks.
+    const engine = xtts ? "xtts" : kokoro ? "kokoro" : piper ? "piper" : "espeak";
     const out = `${tmp}.mp3`;
     const args = [
       path.join(scripts, "offline_tts.py"),
       "--one", SAMPLE[lang] ?? SAMPLE.en,
       "--lang", lang,
       "--gender", gender,
-      "--voice", kokoro ? kokoroVoiceFor(lang, gender) : "",
+      "--voice", xtts ? "Ana Florence" : kokoro ? kokoroVoiceFor(lang, gender) : "",
       "--engine", engine,
       "--out", out,
       ...(piper ? ["--piper-model", piper] : []),
       ...(kokoro ? ["--kokoro-model", kokoro.model, "--kokoro-voices", kokoro.voices] : []),
+      ...(xtts ? ["--xtts-model", xtts] : []),
     ];
-    const res = await run(PY, args, { killAfterMs: 180_000 });
+    const res = await run(PY, args, { killAfterMs: 300_000 });
     if (res.code !== 0 || !fs.existsSync(out) || fs.statSync(out).size < 512) {
       return NextResponse.json(
         { ok: false, engine, error: res.stderr.slice(-500) || "no audio produced" },

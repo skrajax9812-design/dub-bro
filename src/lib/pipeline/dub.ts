@@ -13,7 +13,14 @@ import {
 } from "@/lib/fftools";
 import { jobDir } from "@/lib/storage";
 import { defaultVoiceFor, voiceById } from "@/lib/voices";
-import { findLocalKokoro, findLocalPiperVoice, findLocalWhisperModel, kokoroVoiceFor } from "@/lib/models";
+import {
+  findLocalKokoro,
+  findLocalPiperVoice,
+  findLocalWhisperModel,
+  findLocalXtts,
+  kokoroVoiceFor,
+  xttsSupports,
+} from "@/lib/models";
 import { translateAll } from "./translate";
 
 /* ------------------------------------------------------------------ */
@@ -47,7 +54,7 @@ function canReachHf(): Promise<boolean> {
   return hfReachable;
 }
 
-type TtsEngine = "edge" | "kokoro" | "piper" | "offline";
+type TtsEngine = "edge" | "xtts" | "kokoro" | "piper" | "offline";
 
 /**
  * auto  -> online neural voice when reachable, else Piper, else the built-in
@@ -58,13 +65,29 @@ async function resolveTtsEngine(job: JobRow): Promise<TtsEngine> {
   const gender = voiceById(job.voiceId)?.gender ?? "M";
   const kokoro = findLocalKokoro();
   const piper = findLocalPiperVoice(job.targetLang, gender);
+  // Voice cloning wins whenever the model and a speaker clip are available — but
+  // XTTS runs on CPU here, so very long videos would take hours. Past the budget
+  // the pipeline uses the neural voice instead (raise CLONE_MAX_SEC to override).
+  const cloneBudgetSec = Number(process.env.CLONE_MAX_SEC ?? 180);
+  const withinCloneBudget = (job.durationSec ?? 0) <= cloneBudgetSec;
+  const clone =
+    findLocalXtts() && xttsSupports(job.targetLang) && withinCloneBudget ? "xtts" : null;
+  if (findLocalXtts() && xttsSupports(job.targetLang) && !withinCloneBudget) {
+    void addLog(
+      job.id,
+      `Video is ${((job.durationSec ?? 0) / 60).toFixed(1)} min — longer than the ${(cloneBudgetSec / 60).toFixed(0)} min cloning budget, so the neural voice is used instead (set CLONE_MAX_SEC to change).`,
+    );
+  }
+  const best = (): TtsEngine => clone ?? (kokoro ? "kokoro" : piper ? "piper" : "offline");
   if (forced === "edge") return "edge";
-  if (forced === "kokoro") return kokoro ? "kokoro" : piper ? "piper" : "offline";
-  if (forced === "piper") return piper ? "piper" : "offline";
-  if (forced === "offline") return kokoro ? "kokoro" : piper ? "piper" : "offline";
-  if (await canReachEdgeTts()) return "edge";
-  if (kokoro) return "kokoro";
-  return piper ? "piper" : "offline";
+  if (forced === "xtts") return clone ?? best();
+  if (forced === "kokoro") return kokoro ? "kokoro" : best();
+  if (forced === "piper") return piper ? "piper" : best();
+  if (forced === "offline") return best();
+  // auto: the visitor's own browser may reach Edge-TTS, but a local clone is
+  // better than a generic cloud voice, so only prefer Edge when no clone exists.
+  if (!clone && (await canReachEdgeTts())) return "edge";
+  return best();
 }
 
 export function activeEngineLabel(): string {
@@ -208,7 +231,13 @@ async function stageExtract(job: JobRow, dir: string) {
     try {
       const res = await run(
         PY,
-        [path.join(SCRIPTS, "voice_profile.py"), "--audio", audioPath, "--out", profilePath],
+        [
+          path.join(SCRIPTS, "voice_profile.py"),
+          "--audio", audioPath,
+          "--out", profilePath,
+          "--reference", path.join(dir, "reference.wav"),
+          "--ref-seconds", "12",
+        ],
         { killAfterMs: 15 * 60_000 },
       );
       if (res.code === 0) {
@@ -470,6 +499,8 @@ async function stageSynthesize(job: JobRow, dir: string) {
   const gender = voice?.gender ?? "M";
   const piperModel = engine === "piper" ? findLocalPiperVoice(job.targetLang, gender) : null;
   const kokoro = engine === "kokoro" ? findLocalKokoro() : null;
+  const xttsModel = engine === "xtts" ? findLocalXtts() : null;
+  const reference = path.join(dir, "reference.wav");
   // Kokoro voices are picked by language + gender; Piper by the installed voice.
   const synthVoice =
     engine === "kokoro" ? kokoroVoiceFor(job.targetLang, gender) : engine === "piper" ? "" : voiceId;
@@ -479,7 +510,9 @@ async function stageSynthesize(job: JobRow, dir: string) {
   const engineLabel =
     engine === "edge"
       ? `Edge neural voice ${voiceId}`
-      : engine === "kokoro"
+      : engine === "xtts"
+        ? "XTTS-v2 voice clone (speaking as the person in your video)"
+        : engine === "kokoro"
         ? `Kokoro-82M neural voice ${synthVoice}`
         : engine === "piper"
           ? `Piper neural voice ${piperModel ? path.basename(piperModel) : job.targetLang}`
@@ -490,22 +523,46 @@ async function stageSynthesize(job: JobRow, dir: string) {
     job.id,
     `TTS engine — ${engineLabel} · rate ${rate} · pitch ${pitch}${hasProfile ? " · voice-matched to the source speaker" : ""}`,
   );
-  if (engine !== "edge" && !hasProfile) {
+  if (engine === "xtts") {
+    await addLog(
+      job.id,
+      "Cloning the speaker from a clean 12 s reference taken out of your video — the dub will use that voice.",
+    );
+    const minutes = (job.durationSec ?? 0) / 60;
+    if (minutes > 4) {
+      await addLog(
+        job.id,
+        `Heads-up: cloning runs on CPU, so ${minutes.toFixed(1)} min of speech takes a while (roughly ${Math.ceil(minutes * 3)}–${Math.ceil(minutes * 6)} min). Keep this tab open.`,
+      );
+    }
+  } else if (engine !== "edge" && !hasProfile) {
     await addLog(job.id, "Voice matching unavailable for this job — synthesizing with the raw voice timbre.");
   }
 
-  const items = segs
-    .map((s) => ({
-      i: s.idx,
-      text: (s.translatedText ?? s.sourceText).trim(),
-      voice: synthVoice,
-      lang: job.targetLang,
-      gender,
-      rate,
-      pitch,
-      slotMs: Math.max(0, s.endMs - s.startMs),
-      out: path.join(segDir, `seg_${s.idx}.mp3`),
-    }))
+  // A line may use the pause that follows it, so its real budget runs until the
+  // next line begins. That alone removes most of the "compressed, rushed" sound.
+  const ordered = [...segs].sort((a, b) => a.startMs - b.startMs);
+  const nextStart = new Map<number, number>();
+  ordered.forEach((s, i) => {
+    const next = ordered[i + 1];
+    nextStart.set(s.idx, next ? next.startMs : s.endMs);
+  });
+
+  const items = ordered
+    .map((s) => {
+      const budget = Math.max(300, (nextStart.get(s.idx) ?? s.endMs) - s.startMs);
+      return {
+        i: s.idx,
+        text: (s.translatedText ?? s.sourceText).trim(),
+        voice: synthVoice,
+        lang: job.targetLang,
+        gender,
+        rate,
+        pitch,
+        slotMs: budget,
+        out: path.join(segDir, `seg_${s.idx}.mp3`),
+      };
+    })
     .filter((it) => it.text.length > 0);
 
   const manifest = path.join(dir, "tts_manifest.json");
@@ -523,6 +580,8 @@ async function stageSynthesize(job: JobRow, dir: string) {
           ...(hasProfile ? ["--profile", profilePath] : []),
           ...(piperModel ? ["--piper-model", piperModel] : []),
           ...(kokoro ? ["--kokoro-model", kokoro.model, "--kokoro-voices", kokoro.voices] : []),
+          ...(xttsModel ? ["--xtts-model", xttsModel] : []),
+          ...(fs.existsSync(reference) ? ["--reference", reference] : []),
         ];
   const res = await run(
     PY,
@@ -591,6 +650,46 @@ async function stageSynthesize(job: JobRow, dir: string) {
 /* ------------------------------------------------------------------ */
 /* Stage 5 — Timeline sync, mix windows, watermark-free mux            */
 /* ------------------------------------------------------------------ */
+
+/**
+ * Two-pass EBU R128 normalisation. A single loudnorm pass lands several LU off
+ * target on speech with pauses; measuring first and then applying with the
+ * measured values puts the track on -16 LUFS accurately.
+ */
+async function loudnormToWav(src: string, dest: string): Promise<number> {
+  // Dialogue sits at -18 LUFS; speech peaks (plosives) are far above the average,
+  // so a limiter is used instead of loudnorm's own gain riding — that keeps the
+  // level on target without the pumping that makes a dub sound robotic.
+  const TARGET_LUFS = -18;
+  const LIMIT = 0.89; // ≈ -1 dBFS
+  let af = `loudnorm=I=${TARGET_LUFS}:TP=-1.5:LRA=11`;
+  try {
+    const probe = await run(FFMPEG, [
+      "-y", "-i", src,
+      "-af", "loudnorm=I=-18:TP=-1.5:LRA=11:print_format=json",
+      "-f", "null", "-",
+    ]);
+    const open = probe.stderr.lastIndexOf("{");
+    const close = probe.stderr.lastIndexOf("}");
+    if (open < 0 || close <= open) throw new Error("no loudnorm measurements in stderr");
+    const jsonText = probe.stderr.slice(open, close + 1);
+    const m = JSON.parse(jsonText) as Record<string, string>;
+    const inputI = Number(m.input_i);
+    const inputTp = Number(m.input_tp);
+    if (Number.isFinite(inputI) && Number.isFinite(inputTp)) {
+      const gain = Math.max(-12, Math.min(20, TARGET_LUFS - inputI));
+      af = `volume=${gain.toFixed(2)}dB,alimiter=limit=${LIMIT}:attack=5:release=100:level=disabled`;
+    }
+  } catch {
+    /* keep the loudnorm fallback */
+  }
+  await runChecked(
+    FFMPEG,
+    ["-y", "-i", src, "-af", af, "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", dest],
+    { killAfterMs: 60 * 60_000 },
+  );
+  return 0;
+}
 
 async function stageMux(job: JobRow, dir: string) {
   await setProgress(job.id, "sync", 84, "Building the dubbed timeline…");
@@ -664,16 +763,7 @@ async function stageMux(job: JobRow, dir: string) {
     await runChecked(FFMPEG, ["-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c:a", "copy", joined], { killAfterMs: 30 * 60_000 });
   }
   const dubWav = path.join(dir, "dub_track.wav");
-  await runChecked(
-    FFMPEG,
-    [
-      "-y", "-i", joined,
-      "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-      "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le",
-      dubWav,
-    ],
-    { killAfterMs: 60 * 60_000 },
-  );
+  await loudnormToWav(joined, dubWav);
 
   // Final multiplex — video stream copied untouched, NO watermark, ever.
   await setProgress(job.id, "sync", 94, "Multiplexing final MP4…");

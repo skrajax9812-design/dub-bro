@@ -186,8 +186,8 @@ export function Studio() {
   }, []);
 
   useEffect(() => {
-    if (job?.status === "awaiting_transcript") void loadModels();
-  }, [job?.status, loadModels]);
+    if (job?.status === "awaiting_transcript" || !job) void loadModels();
+  }, [job?.status, job, loadModels]);
 
   useEffect(() => {
     try {
@@ -542,6 +542,7 @@ export function Studio() {
                 onChange={setSettings}
                 onPreview={previewVoice}
                 previewing={previewing}
+                voiceEngine={activeEngine}
               />
               <button
                 onClick={startDub}

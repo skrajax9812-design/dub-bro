@@ -183,11 +183,13 @@ export function SettingsPanel({
   onChange,
   onPreview,
   previewing,
+  voiceEngine,
 }: {
   settings: DubSettings;
   onChange: (s: DubSettings) => void;
   onPreview: () => void;
   previewing: boolean;
+  voiceEngine?: string | null;
 }) {
   const voices = voicesForLanguage(settings.targetLang);
   const set = (patch: Partial<DubSettings>) => onChange({ ...settings, ...patch });
@@ -198,6 +200,32 @@ export function SettingsPanel({
         <Kicker>[ DUB CONFIGURATION ]</Kicker>
         <SlidersHorizontal className="h-4 w-4 text-zinc-500" />
       </div>
+
+      {voiceEngine && (
+        <div
+          className={`flex items-center gap-2.5 rounded-xl border px-3.5 py-2.5 ${
+            voiceEngine === "xtts"
+              ? "border-mint/40 bg-mint/[0.07]"
+              : "border-edge bg-ink/50"
+          }`}
+        >
+          <Mic className={`h-4 w-4 shrink-0 ${voiceEngine === "xtts" ? "text-mint" : "text-zinc-500"}`} />
+          <div className="min-w-0">
+            <div className="font-mono text-[9px] tracking-[0.2em] text-zinc-500">VOICE ENGINE</div>
+            <div className="truncate text-[12.5px] font-semibold text-white">
+              {voiceEngine === "xtts"
+                ? "XTTS-v2 clone — speaks as the person in your video"
+                : voiceEngine === "kokoro"
+                  ? "Kokoro-82M neural voice"
+                  : voiceEngine === "piper"
+                    ? "Piper neural voice"
+                    : voiceEngine === "edge"
+                      ? "Edge neural voice"
+                      : "Built-in offline voice (robotic — install a neural voice)"}
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-4">
         <Field label="SOURCE" icon={Globe2}>

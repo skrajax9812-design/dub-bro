@@ -4,6 +4,7 @@ import {
   findLocalKokoro,
   findLocalPiperVoice,
   findLocalWhisperModel,
+  findLocalXtts,
   kokoroVoiceFor,
   modelsRoot,
   presetStatus,
@@ -17,6 +18,7 @@ export async function GET() {
   const whisperDir = findLocalWhisperModel();
   const piperHi = findLocalPiperVoice("hi", "M");
   const kokoro = findLocalKokoro();
+  const xtts = findLocalXtts();
   return NextResponse.json({
     root: modelsRoot(),
     presets: MODEL_PRESETS.map((p) => ({
@@ -27,8 +29,9 @@ export async function GET() {
       whisper: whisperDir ? whisperDir.split("/").pop() : null,
       piper: piperHi ? piperHi.split("/").pop() : null,
       kokoro: kokoro ? "kokoro-v1.0" : null,
+      clone: xtts ? "xtts-v2" : null,
       // Which engine a job would use right now.
-      engine: kokoro ? "kokoro" : piperHi ? "piper" : "espeak",
+      engine: xtts ? "xtts" : kokoro ? "kokoro" : piperHi ? "piper" : "espeak",
       kokoroVoices: { hi: [kokoroVoiceFor("hi", "F"), kokoroVoiceFor("hi", "M")] },
     },
   });

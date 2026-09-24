@@ -117,13 +117,68 @@ def ltas_bands(a: np.ndarray, sr: int):
     return out
 
 
+def best_reference_window(a: np.ndarray, sr: int, seconds: float) -> tuple[int, int]:
+    """
+    Locate the cleanest `seconds` of continuous speech — the clip a voice-cloning
+    engine should learn the speaker from. Picks the window with the most speech
+    energy and the fewest internal silences.
+    """
+    win = int(seconds * sr)
+    if len(a) <= win:
+        return 0, len(a)
+    hop = int(0.25 * sr)
+    frame = int(0.02 * sr)
+    # per-frame energy -> speech/silence
+    energies = []
+    for i in range(0, len(a) - frame, frame):
+        seg = a[i : i + frame]
+        energies.append(float(np.sqrt((seg**2).mean())))
+    energies = np.asarray(energies)
+    voiced = energies > max(0.006, float(np.percentile(energies, 60)))
+
+    best = (0, win, -1.0)
+    for start in range(0, len(a) - win, hop):
+        lo, hi = start // frame, (start + win) // frame
+        if hi > len(voiced):
+            break
+        chunk = voiced[lo:hi]
+        if len(chunk) == 0:
+            continue
+        ratio = float(chunk.mean())
+        # Longest unbroken speech run inside the window, in seconds.
+        longest = run = 0
+        for v in chunk:
+            run = run + 1 if v else 0
+            longest = max(longest, run)
+        score = ratio * 0.6 + (longest * frame / sr) / seconds * 0.4
+        if score > best[2]:
+            best = (start, start + win, score)
+    return best[0], best[1]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--audio", required=True)
     ap.add_argument("--out", default="")
+    ap.add_argument("--reference", default="", help="write a clean speaker clip here (for voice cloning)")
+    ap.add_argument("--ref-seconds", type=float, default=12.0)
     args = ap.parse_args()
 
     a, sr = read_wav(args.audio)
+
+    if args.reference:
+        lo, hi = best_reference_window(a, sr, args.ref_seconds)
+        ref = a[lo:hi]
+        # Cloning engines want a quiet, levelled clip: peak-normalise to -3 dBFS.
+        peak = float(np.max(np.abs(ref))) if len(ref) else 0.0
+        if peak > 0:
+            ref = ref * (0.7 / peak)
+        with wave.open(args.reference, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            w.writeframes((np.clip(ref, -1, 1) * 32767).astype("<i2").tobytes())
+        print(f"REFERENCE {args.reference} {lo / sr:.1f}s-{hi / sr:.1f}s", file=sys.stderr, flush=True)
     f0, p10, p90, speech_ratio = median_f0(a, sr)
     bands = ltas_bands(a, sr)
 
