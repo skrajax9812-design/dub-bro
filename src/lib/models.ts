@@ -48,7 +48,7 @@ export const MODEL_PRESETS: ModelPreset[] = [
       hf("Systran/faster-whisper-tiny", "config.json", "asr/whisper-tiny/config.json", 2_000),
       hf("Systran/faster-whisper-tiny", "model.bin", "asr/whisper-tiny/model.bin", 75_000_000),
       hf("Systran/faster-whisper-tiny", "tokenizer.json", "asr/whisper-tiny/tokenizer.json", 2_200_000),
-      hf("Systran/faster-whisper-tiny", "vocabulary.txt", "asr/whisper-tiny/vocabulary.txt", 400_000),
+      hf("Systran/faster-whisper-tiny", "vocabulary.txt", "asr/whisper-tiny/vocabulary.txt", 460_000),
     ],
   },
   {
@@ -60,7 +60,7 @@ export const MODEL_PRESETS: ModelPreset[] = [
       hf("Systran/faster-whisper-base", "config.json", "asr/whisper-base/config.json", 2_000),
       hf("Systran/faster-whisper-base", "model.bin", "asr/whisper-base/model.bin", 145_000_000),
       hf("Systran/faster-whisper-base", "tokenizer.json", "asr/whisper-base/tokenizer.json", 2_200_000),
-      hf("Systran/faster-whisper-base", "vocabulary.txt", "asr/whisper-base/vocabulary.txt", 800_000),
+      hf("Systran/faster-whisper-base", "vocabulary.txt", "asr/whisper-base/vocabulary.txt", 460_000),
     ],
   },
   {
@@ -72,7 +72,7 @@ export const MODEL_PRESETS: ModelPreset[] = [
       hf("Systran/faster-whisper-small", "config.json", "asr/whisper-small/config.json", 2_000),
       hf("Systran/faster-whisper-small", "model.bin", "asr/whisper-small/model.bin", 490_000_000),
       hf("Systran/faster-whisper-small", "tokenizer.json", "asr/whisper-small/tokenizer.json", 2_200_000),
-      hf("Systran/faster-whisper-small", "vocabulary.txt", "asr/whisper-small/vocabulary.txt", 1_200_000),
+      hf("Systran/faster-whisper-small", "vocabulary.txt", "asr/whisper-small/vocabulary.txt", 460_000),
     ],
   },
   {
@@ -84,7 +84,7 @@ export const MODEL_PRESETS: ModelPreset[] = [
       hf("Systran/faster-whisper-medium", "config.json", "asr/whisper-medium/config.json", 2_000),
       hf("Systran/faster-whisper-medium", "model.bin", "asr/whisper-medium/model.bin", 1_530_000_000),
       hf("Systran/faster-whisper-medium", "tokenizer.json", "asr/whisper-medium/tokenizer.json", 2_200_000),
-      hf("Systran/faster-whisper-medium", "vocabulary.txt", "asr/whisper-medium/vocabulary.txt", 1_400_000),
+      hf("Systran/faster-whisper-medium", "vocabulary.txt", "asr/whisper-medium/vocabulary.txt", 460_000),
     ],
   },
   {
