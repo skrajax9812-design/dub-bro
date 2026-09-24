@@ -76,6 +76,28 @@ export const MODEL_PRESETS: ModelPreset[] = [
     ],
   },
   {
+    id: "whisper-medium",
+    kind: "asr",
+    label: "Whisper Medium (ASR, ~1.5 GB)",
+    note: "Best accuracy for Indic languages and strong accents. Slower on CPU.",
+    files: [
+      hf("Systran/faster-whisper-medium", "config.json", "asr/whisper-medium/config.json", 2_000),
+      hf("Systran/faster-whisper-medium", "model.bin", "asr/whisper-medium/model.bin", 1_530_000_000),
+      hf("Systran/faster-whisper-medium", "tokenizer.json", "asr/whisper-medium/tokenizer.json", 2_200_000),
+      hf("Systran/faster-whisper-medium", "vocabulary.txt", "asr/whisper-medium/vocabulary.txt", 1_400_000),
+    ],
+  },
+  {
+    id: "kokoro-hi",
+    kind: "tts",
+    label: "Kokoro-82M — Hindi voices (best quality, ~340 MB)",
+    note: "Top-tier neural voice, Hindi female (hf_alpha) and male (hm_omega). The most natural option here.",
+    files: [
+      hf("thewh1teagle/kokoro-onnx", "kokoro-v1.0.onnx", "tts/kokoro/kokoro-v1.0.onnx", 310_000_000),
+      hf("thewh1teagle/kokoro-onnx", "voices-v1.0.bin", "tts/kokoro/voices-v1.0.bin", 27_000_000),
+    ],
+  },
+  {
     id: "piper-hi-male",
     kind: "tts",
     label: "Piper Hindi — Pratham (male, ~63 MB)",
@@ -164,27 +186,67 @@ export function findLocalWhisperModel(): string | null {
   } catch {
     return null;
   }
-  const rank = ["whisper-small", "whisper-base", "whisper-tiny"];
+  const rank = ["whisper-medium", "whisper-small", "whisper-base", "whisper-tiny"];
   const found = entries
     .filter((e) => fs.existsSync(path.join(dir, e, "model.bin")))
     .sort((a, b) => rank.indexOf(a) - rank.indexOf(b));
   return found.length > 0 ? path.join(dir, found[0]) : null;
 }
 
-/** Local Piper voice for a language, preferring the requested gender. */
+
+/* ------------------------------------------------------------------ */
+/* Engine resolution                                                   */
+/* ------------------------------------------------------------------ */
+
+export interface KokoroFiles {
+  model: string;
+  voices: string;
+}
+
+/** Local Kokoro-82M ONNX model + voice bank, when both are installed. */
+export function findLocalKokoro(): KokoroFiles | null {
+  const model = path.join(modelsRoot(), "tts", "kokoro", "kokoro-v1.0.onnx");
+  const voices = path.join(modelsRoot(), "tts", "kokoro", "voices-v1.0.bin");
+  if (fs.existsSync(model) && fs.existsSync(voices)) return { model, voices };
+  return null;
+}
+
+/**
+ * Kokoro voice ids by language + gender. Kokoro prefixes voices with their
+ * language (h* = Hindi, a* = American English, b* = British English).
+ */
+export function kokoroVoiceFor(lang: string, gender: string): string {
+  const table: Record<string, { F: string; M: string }> = {
+    hi: { F: "hf_alpha", M: "hm_omega" },
+    en: { F: "af_heart", M: "am_michael" },
+  };
+  const row = table[lang] ?? table.en;
+  return gender === "F" ? row.F : row.M;
+}
+
+/** Piper voices may live in data/models/tts directly or in a subfolder. */
 export function findLocalPiperVoice(lang: string, gender: string): string | null {
-  const dir = path.join(modelsRoot(), "tts");
-  let files: string[] = [];
-  try {
-    files = fs.readdirSync(dir);
-  } catch {
-    return null;
+  const roots = [path.join(modelsRoot(), "tts"), path.join(modelsRoot(), "tts", "piper")];
+  const onnx: string[] = [];
+  for (const dir of roots) {
+    try {
+      for (const f of fs.readdirSync(dir)) {
+        if (f.endsWith(".onnx")) onnx.push(path.join(dir, f));
+      }
+    } catch {
+      /* directory missing */
+    }
   }
-  const onnx = files.filter((f) => f.endsWith(".onnx"));
-  if (onnx.length === 0) return null;
-  const langMatch = onnx.filter((f) => f.toLowerCase().startsWith(`${lang.toLowerCase()}_`));
-  const pool = langMatch.length > 0 ? langMatch : onnx.filter((f) => f.startsWith("hi_"));
+  // Only voices that ship the matching .onnx.json config can be used.
+  const usable = onnx.filter((p) => fs.existsSync(p + ".json"));
+  if (usable.length === 0) return null;
+  const langMatch = usable.filter((p) =>
+    path.basename(p).toLowerCase().startsWith(`${lang.toLowerCase()}_`),
+  );
+  const pool = langMatch.length > 0 ? langMatch : usable.filter((p) => path.basename(p).startsWith("hi_"));
   if (pool.length === 0) return null;
-  const preferred = pool.find((f) => (gender === "F" ? /priyamvada|female/i.test(f) : /pratham|male/i.test(f)));
-  return path.join(dir, preferred ?? pool[0]);
+  const preferred = pool.find((p) =>
+    gender === "F" ? /priyamvada|female/i.test(p) : /pratham|male/i.test(p),
+  );
+  return preferred ?? pool[0];
 }

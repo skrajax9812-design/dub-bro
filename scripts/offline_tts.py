@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Offline neural-free TTS worker — espeak-ng (bundled with espeakng-loader) with an
-optional Piper voice, plus *voice matching*: the synthesized line is pitch-shifted
-and EQ-shaped so it lands in the same pitch range and tonal balance as the speaker
-in the source video.
+TTS worker with a quality ladder: Kokoro-82M -> Piper -> espeak-ng.
 
-Manifest mode (same protocol as tts_batch.py):
-  [{"i":0,"text":"...","lang":"hi","gender":"F","rate":"+0%","pitch":"+0Hz","out":"/path/seg_0.mp3"}]
-Single-shot mode:
-  --one "text" --lang hi --gender F --out /tmp/x.mp3
+Every engine gets the same post-processing:
+  * **voice matching** — pitch + tone are bent onto the speaker profiled from the
+    source video (`scripts/voice_profile.py`), so the dub sounds like the same person
+  * **fit to slot** — the line is re-rendered at a slower/faster native rate first
+    (best quality) and only then time-compressed, so the dub never sounds chipmunked
+  * **broadcast polish** — loudness normalisation to -18 LUFS with a true-peak ceiling
+
+Manifest (same protocol as the Edge-TTS worker):
+  [{"i":0,"text":"...","lang":"hi","gender":"F","voice":"hf_alpha",
+    "slotMs":2400,"rate":"+0%","out":"/path/seg_0.mp3"}]
 Prints: OK <i> | FAIL <i> | DONE ok=N fail=M
 """
 import argparse
@@ -28,6 +31,12 @@ ESPEAK_RATE = 22050
 CALIBRATION_TEXT = "The quick brown fox jumps over the lazy dog every single morning."
 BANDS = [(80, 200), (200, 400), (400, 800), (800, 1600), (1600, 3200), (3200, 6400)]
 BAND_CENTERS = [140, 300, 600, 1200, 2400, 4800]
+MAX_ATEMPO = 1.45
+MAX_NATIVE_SPEEDUP = 1.4
+OUT_RATE = 24000
+
+# ------------------------------------------------------------------ espeak
+
 
 _lib = None
 _cb_ref = None
@@ -35,7 +44,6 @@ _espeak_buffer = bytearray()
 
 
 def espeak_lib():
-    """Load the espeak-ng shared library that ships inside espeakng-loader."""
     global _lib, _cb_ref
     if _lib is not None:
         return _lib
@@ -52,7 +60,9 @@ def espeak_lib():
         return 0
 
     _cb_ref = cb_type(_on_audio)
-    lib.espeak_Initialize(ctypes.c_int(1), ctypes.c_int(0), espeakng_loader.get_data_path().encode(), ctypes.c_int(0))
+    lib.espeak_Initialize(
+        ctypes.c_int(1), ctypes.c_int(0), espeakng_loader.get_data_path().encode(), ctypes.c_int(0)
+    )
     lib.espeak_SetSynthCallback(_cb_ref)
     _lib = lib
     return lib
@@ -60,6 +70,9 @@ def espeak_lib():
 
 def espeak_voice_name(lang: str, gender: str) -> str:
     base = (lang or "en").lower()
+    if base in ("hi", "ur", "bn", "ta", "te", "mr", "gu", "kn", "ml", "pa"):
+        # Indic espeak voices do not accept the +f3/+m3 variants reliably.
+        return base
     if gender == "F":
         return f"{base}+f3"
     if gender == "M":
@@ -67,14 +80,13 @@ def espeak_voice_name(lang: str, gender: str) -> str:
     return base
 
 
-def synth_espeak(text: str, lang: str, gender: str, wpm: int, pitch: int) -> np.ndarray:
-    """Return float32 mono samples at ESPEAK_RATE."""
+def synth_espeak(text: str, lang: str, gender: str, wpm: int, pitch: int) -> tuple[np.ndarray, int]:
     lib = espeak_lib()
     name = espeak_voice_name(lang, gender).encode()
     if lib.espeak_SetVoiceByName(ctypes.c_char_p(name)) != 0:
         lib.espeak_SetVoiceByName(ctypes.c_char_p((lang or "en").lower().encode()))
-    lib.espeak_SetParameter(ctypes.c_int(1), ctypes.c_int(int(wpm)), ctypes.c_int(0))  # rate
-    lib.espeak_SetParameter(ctypes.c_int(3), ctypes.c_int(int(pitch)), ctypes.c_int(0))  # pitch
+    lib.espeak_SetParameter(ctypes.c_int(1), ctypes.c_int(int(wpm)), ctypes.c_int(0))
+    lib.espeak_SetParameter(ctypes.c_int(3), ctypes.c_int(int(pitch)), ctypes.c_int(0))
     _espeak_buffer.clear()
     raw = text.encode("utf-8")
     lib.espeak_Synth(
@@ -89,8 +101,82 @@ def synth_espeak(text: str, lang: str, gender: str, wpm: int, pitch: int) -> np.
     )
     lib.espeak_Synchronize()
     if not _espeak_buffer:
-        return np.zeros(0, dtype=np.float32)
-    return np.frombuffer(bytes(_espeak_buffer), dtype="<i2").astype(np.float32) / 32768.0
+        return np.zeros(0, dtype=np.float32), ESPEAK_RATE
+    return np.frombuffer(bytes(_espeak_buffer), dtype="<i2").astype(np.float32) / 32768.0, ESPEAK_RATE
+
+
+# ------------------------------------------------------------------ piper
+
+_piper_cache: dict[str, object] = {}
+
+
+def piper_ready(model_path: str) -> bool:
+    return bool(model_path) and os.path.exists(model_path) and os.path.exists(model_path + ".json")
+
+
+def synth_piper(text: str, model_path: str, length_scale: float) -> tuple[np.ndarray, int] | None:
+    if not piper_ready(model_path):
+        return None
+    try:
+        from piper import PiperVoice, SynthesisConfig
+
+        voice = _piper_cache.get(model_path)
+        if voice is None:
+            voice = PiperVoice.load(model_path)
+            _piper_cache[model_path] = voice
+        cfg = SynthesisConfig(length_scale=float(np.clip(length_scale, 0.7, 1.6)))
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            with wave.open(tmp_path, "wb") as wav_file:
+                voice.synthesize_wav(text, wav_file, syn_config=cfg)
+            with wave.open(tmp_path, "rb") as wav_file:
+                sr = wav_file.getframerate()
+                raw = wav_file.readframes(wav_file.getnframes())
+            return np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0, sr
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    except Exception as e:
+        print(f"piper failed ({e})", file=sys.stderr, flush=True)
+        return None
+
+
+# ------------------------------------------------------------------ kokoro
+
+_kokoro = None
+
+
+def kokoro_ready(model_path: str, voices_path: str) -> bool:
+    return bool(model_path) and bool(voices_path) and os.path.exists(model_path) and os.path.exists(voices_path)
+
+
+def synth_kokoro(
+    text: str, model_path: str, voices_path: str, voice: str, speed: float
+) -> tuple[np.ndarray, int] | None:
+    global _kokoro
+    if not kokoro_ready(model_path, voices_path):
+        return None
+    try:
+        from kokoro_onnx import Kokoro
+
+        if _kokoro is None:
+            _kokoro = Kokoro(model_path, voices_path)
+        ko = _kokoro
+        lang = "en-us"
+        if voice and len(voice) >= 2:
+            # Kokoro voice ids are prefixed with their language (hf_ = Hindi female)
+            lang = {"h": "hi", "a": "en-us", "b": "en-gb"}.get(voice[0], "en-us")
+        samples, sr = ko.create(text, voice=voice, speed=float(np.clip(speed, 0.7, 1.5)), lang=lang)
+        return np.asarray(samples, dtype=np.float32), int(sr)
+    except Exception as e:
+        print(f"kokoro failed ({e})", file=sys.stderr, flush=True)
+        return None
+
+
+# ------------------------------------------------------------------ analysis
 
 
 def median_f0(a: np.ndarray, sr: int, fmin=60.0, fmax=400.0):
@@ -134,53 +220,6 @@ def band_levels(a: np.ndarray, sr: int):
     return out
 
 
-class VoiceMatcher:
-    """Works out the pitch ratio + EQ curve that turns the TTS voice into the speaker."""
-
-    def __init__(self, profile_path: str, voice_key: str, lang: str, gender: str, calibrate=None):
-        self.enabled = False
-        self.ratio = 1.0
-        self.gains = [0.0] * len(BANDS)
-        try:
-            with open(profile_path, encoding="utf-8") as f:
-                prof = json.load(f)
-        except Exception:
-            return
-        target_f0 = prof.get("f0Median")
-        target_bands = prof.get("bands")
-        if not target_f0 or not target_bands:
-            return
-        sample_rate = ESPEAK_RATE
-        sample = None
-        if calibrate is not None:
-            rendered = calibrate(CALIBRATION_TEXT)
-            if rendered:
-                sample, sample_rate = rendered
-        if sample is None:
-            sample = synth_espeak(CALIBRATION_TEXT, lang, gender, 160, 50)
-        if len(sample) < sample_rate // 2:
-            return
-        tts_f0 = median_f0(sample, sample_rate)
-        tts_bands = band_levels(sample, sample_rate)
-        if not tts_f0 or not tts_bands:
-            return
-        self.ratio = float(np.clip(target_f0 / tts_f0, 0.45, 1.8))
-        # Normalise both curves to their own mean so we match *shape*, not loudness.
-        t_off = float(np.mean(target_bands))
-        s_off = float(np.mean(tts_bands))
-        self.gains = [
-            float(np.clip((target_bands[k] - t_off) - (tts_bands[k] - s_off), -8.0, 8.0))
-            for k in range(len(BANDS))
-        ]
-        self.enabled = True
-        print(
-            f"VOICEMATCH {voice_key} ratio={self.ratio:.3f} "
-            f"f0={target_f0:.0f}Hz gains={[round(g,1) for g in self.gains]}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-
 def write_wav(path: str, a: np.ndarray, sr: int) -> None:
     with wave.open(path, "wb") as w:
         w.setnchannels(1)
@@ -189,66 +228,130 @@ def write_wav(path: str, a: np.ndarray, sr: int) -> None:
         w.writeframes((np.clip(a, -1, 1) * 32767).astype("<i2").tobytes())
 
 
-def finalize(src_wav: str, out_path: str, matcher: VoiceMatcher | None, rate_pct: int, pitch_hz: int) -> None:
-    """Pitch-match + tone-match + loudness-normalise, then encode to mp3."""
-    chain = []
-    if matcher and matcher.enabled:
-        if abs(matcher.ratio - 1.0) > 0.02:
-            chain.append(f"asetrate={int(ESPEAK_RATE * matcher.ratio)}")
-            chain.append(f"aresample={ESPEAK_RATE}")
-            chain.append(f"atempo={1.0 / matcher.ratio:.5f}")
-        for center, gain in zip(BAND_CENTERS, matcher.gains):
-            if abs(gain) > 0.75:
-                chain.append(f"equalizer=f={center}:t=o:w=1:g={gain:.2f}")
-    if pitch_hz:
-        chain.append(f"rubberband=pitch={2 ** (pitch_hz / 1200):.4f}")
-    chain.append("loudnorm=I=-18:TP=-2:LRA=11")
-    args = [FFMPEG, "-y", "-v", "error", "-i", src_wav, "-ac", "1", "-ar", "24000"]
-    if chain:
-        args += ["-af", ",".join(chain)]
-    args += ["-c:a", "libmp3lame", "-b:a", "128k", out_path]
-    subprocess.run(args, check=True)
+# ------------------------------------------------------------------ engines
 
 
-_piper_cache: dict[str, object] = {}
+class Engine:
+    """One synthesis backend, with voice matching calibrated on its own output."""
 
+    def __init__(self, name: str, opts: argparse.Namespace, profile: dict | None):
+        self.name = name
+        self.opts = opts
+        self.profile = profile
+        self.ratio = 1.0
+        self.gains = [0.0] * len(BANDS)
+        self.matched = False
+        self._calibrated: dict[str, bool] = {}
 
-def synth_piper(text: str, model_path: str, wpm: int) -> tuple[np.ndarray, int] | None:
-    """Neural Piper voice. Returns None when the voice/package is unavailable."""
-    try:
-        import wave as _wave
+    # -- rendering -----------------------------------------------------
+    def render(self, text: str, lang: str, gender: str, wpm: int, speed: float, voice: str):
+        if self.name == "kokoro":
+            out = synth_kokoro(text, self.opts.kokoro_model, self.opts.kokoro_voices, voice, speed)
+            if out is not None:
+                return out
+        if self.name in ("kokoro", "piper"):
+            out = synth_piper(text, self.opts.piper_model, 175.0 / max(80, wpm) / max(speed, 0.01))
+            if out is not None:
+                return out
+        return synth_espeak(text, lang, gender, int(wpm * speed), self.opts.espeak_pitch)
 
-        from piper import PiperVoice, SynthesisConfig
+    # -- voice matching -------------------------------------------------
+    def calibrate(self, lang: str, gender: str, voice: str) -> None:
+        key = f"{lang}:{gender}:{voice}"
+        if self._calibrated.get(key):
+            return
+        self._calibrated[key] = True
+        if not self.profile:
+            return
+        target_f0 = self.profile.get("f0Median")
+        target_bands = self.profile.get("bands")
+        if not target_f0 or not target_bands:
+            return
+        sample, sr = self.render(CALIBRATION_TEXT, lang, gender, 160, 1.0, voice)
+        if len(sample) < sr // 2:
+            return
+        tts_f0 = median_f0(sample, sr)
+        tts_bands = band_levels(sample, sr)
+        if not tts_f0 or not tts_bands:
+            return
+        self.ratio = float(np.clip(target_f0 / tts_f0, 0.45, 1.8))
+        t_off, s_off = float(np.mean(target_bands)), float(np.mean(tts_bands))
+        self.gains = [
+            float(np.clip((target_bands[k] - t_off) - (tts_bands[k] - s_off), -8.0, 8.0))
+            for k in range(len(BANDS))
+        ]
+        self.matched = True
+        print(
+            f"VOICEMATCH engine={self.name} {key} ratio={self.ratio:.3f} "
+            f"target_f0={target_f0:.0f}Hz tts_f0={tts_f0:.0f}Hz gains={[round(g, 1) for g in self.gains]}",
+            file=sys.stderr,
+            flush=True,
+        )
 
-        voice = _piper_cache.get(model_path)
-        if voice is None:
-            voice = PiperVoice.load(model_path)
-            _piper_cache[model_path] = voice
-        # Piper's natural pace is ~175 wpm; length_scale slows/speeds it.
-        length_scale = float(np.clip(175.0 / max(80, wpm), 0.7, 1.6))
-        cfg = SynthesisConfig(length_scale=length_scale)
+    # -- post processing ------------------------------------------------
+    def fit_and_polish(self, src_wav: str, out_path: str, slot_ms: int | None, rate_pct: int) -> None:
+        chain: list[str] = []
+        if self.matched:
+            if abs(self.ratio - 1.0) > 0.02:
+                # Pitch-shift against the *actual* sample rate of this engine's
+                # output (espeak 22.05k, Piper 22.05k, Kokoro 24k).
+                src_sr = wav_rate(src_wav) or ESPEAK_RATE
+                chain.append(f"asetrate={int(src_sr * self.ratio)}")
+                chain.append(f"aresample={src_sr}")
+                chain.append(f"atempo={1.0 / self.ratio:.5f}")
+            for center, gain in zip(BAND_CENTERS, self.gains):
+                if abs(gain) > 0.75:
+                    chain.append(f"equalizer=f={center}:t=o:w=1:g={gain:.2f}")
+
+        # Fit the slot: pitch/EQ first, then measure, then compress if needed.
+        base = [FFMPEG, "-y", "-v", "error", "-i", src_wav, "-ac", "1", "-ar", str(OUT_RATE)]
+        if chain:
+            base += ["-af", ",".join(chain)]
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            with _wave.open(tmp_path, "wb") as wav_file:
-                voice.synthesize_wav(text, wav_file, syn_config=cfg)
-            with _wave.open(tmp_path, "rb") as wav_file:
-                sr = wav_file.getframerate()
-                raw = wav_file.readframes(wav_file.getnframes())
-            samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
-            return samples, sr
-        finally:
+            fitted = tmp.name
+        base += [fitted]
+        subprocess.run(base, check=True)
+
+        duration = wav_duration(fitted)
+        tempo = 1.0
+        if slot_ms and duration > 0:
+            target = (slot_ms / 1000.0) * (1.0 + rate_pct / 100.0)
+            if duration > target * 1.04:
+                tempo = min(MAX_ATEMPO, duration / target)
+        final = [FFMPEG, "-y", "-v", "error", "-i", fitted, "-ac", "1", "-ar", str(OUT_RATE)]
+        post: list[str] = []
+        if tempo > 1.01:
+            post.append(f"atempo={tempo:.4f}")
+        post.append("loudnorm=I=-18:TP=-2:LRA=11")
+        final += ["-af", ",".join(post), "-c:a", "libmp3lame", "-b:a", "128k", out_path]
+        subprocess.run(final, check=True)
+        for p in (fitted,):
             try:
-                os.unlink(tmp_path)
+                os.unlink(p)
             except OSError:
                 pass
-    except Exception as e:
-        print(f"piper unavailable ({e}) — falling back to espeak-ng", file=sys.stderr, flush=True)
-        return None
+
+
+def wav_rate(path: str) -> int:
+    try:
+        with wave.open(path, "rb") as w:
+            return int(w.getframerate())
+    except Exception:
+        return 0
+
+
+def wav_duration(path: str) -> float:
+    try:
+        with wave.open(path, "rb") as w:
+            return w.getnframes() / float(w.getframerate())
+    except Exception:
+        return 0.0
+
+
+# ------------------------------------------------------------------ helpers
 
 
 def wpm_from_rate(rate: str) -> int:
-    pct = 0
     try:
         pct = int(str(rate).replace("%", "").replace("+", "") or 0)
     except ValueError:
@@ -256,12 +359,15 @@ def wpm_from_rate(rate: str) -> int:
     return int(np.clip(160 * (1 + pct / 100.0), 80, 320))
 
 
-def pitch_param(pitch: str) -> int:
-    try:
-        hz = int(str(pitch).replace("Hz", "").replace("+", "") or 0)
-    except ValueError:
-        hz = 0
-    return int(np.clip(50 + hz / 2, 0, 99))
+def pick_engine(opts: argparse.Namespace, voice: str) -> str:
+    forced = (opts.engine or "auto").lower()
+    if forced != "auto":
+        return forced
+    if kokoro_ready(opts.kokoro_model, opts.kokoro_voices) and voice and voice[0] in "hab":
+        return "kokoro"
+    if piper_ready(opts.piper_model):
+        return "piper"
+    return "espeak"
 
 
 def main() -> None:
@@ -269,52 +375,74 @@ def main() -> None:
     ap.add_argument("--manifest")
     ap.add_argument("--one")
     ap.add_argument("--out")
-    ap.add_argument("--lang", default="en")
-    ap.add_argument("--gender", default="F")
+    ap.add_argument("--lang", default="hi")
+    ap.add_argument("--gender", default="M")
+    ap.add_argument("--voice", default="")
     ap.add_argument("--rate", default="+0%")
-    ap.add_argument("--pitch", default="+0Hz")
     ap.add_argument("--profile", default="")
+    ap.add_argument("--engine", default="auto", choices=["auto", "kokoro", "piper", "espeak"])
     ap.add_argument("--piper-model", default="")
+    ap.add_argument("--kokoro-model", default="")
+    ap.add_argument("--kokoro-voices", default="")
+    ap.add_argument("--espeak-pitch", type=int, default=50)
     args = ap.parse_args()
 
-    matchers: dict[str, VoiceMatcher] = {}
+    profile = None
+    if args.profile and os.path.exists(args.profile):
+        try:
+            with open(args.profile, encoding="utf-8") as f:
+                profile = json.load(f)
+        except Exception:
+            profile = None
 
-    def matcher_for(lang: str, gender: str) -> VoiceMatcher | None:
-        if not args.profile or not os.path.exists(args.profile):
-            return None
-        key = f"{lang}:{gender}"
-        if key not in matchers:
-            # Calibrate against whichever engine actually renders the line, so the
-            # pitch ratio is measured on the real voice, not on a stand-in.
-            calibrate = None
-            if args.piper_model and os.path.exists(args.piper_model):
-                calibrate = lambda text: synth_piper(text, args.piper_model, 175)
-            matchers[key] = VoiceMatcher(args.profile, key, lang, gender, calibrate=calibrate)
-        m = matchers[key]
-        return m if m.enabled else None
+    engines: dict[str, Engine] = {}
 
-    def synth_item(item) -> bool:
+    def engine_for(voice: str) -> Engine:
+        name = pick_engine(args, voice)
+        if name not in engines:
+            engines[name] = Engine(name, args, profile)
+        return engines[name]
+
+    def synth_item(item: dict) -> bool:
         text = (item.get("text") or "").strip()
         out_path = item.get("out")
         if not text or not out_path:
             return False
         lang = item.get("lang") or args.lang
         gender = item.get("gender") or args.gender
+        voice = item.get("voice") or args.voice or ("hf_alpha" if lang == "hi" else "af_heart")
         wpm = wpm_from_rate(item.get("rate") or args.rate)
-        pitch = pitch_param(item.get("pitch") or args.pitch)
+        slot_ms = int(item.get("slotMs") or 0) or None
+        rate_pct = 0
+        try:
+            rate_pct = int(str(item.get("rate") or args.rate).replace("%", "").replace("+", "") or 0)
+        except ValueError:
+            rate_pct = 0
+
+        eng = engine_for(voice)
+        eng.calibrate(lang, gender, voice if eng.name == "kokoro" else "")
+
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = tmp.name
         try:
-            rendered: tuple[np.ndarray, int] | None = None
-            if args.piper_model and os.path.exists(args.piper_model):
-                rendered = synth_piper(text, args.piper_model, wpm)
-            if rendered is None:
-                rendered = (synth_espeak(text, lang, gender, wpm, pitch), ESPEAK_RATE)
-            samples, sample_rate = rendered
-            if len(samples) == 0:
+            samples, sr = eng.render(text, lang, gender, wpm, 1.0, voice)
+            if samples is None or len(samples) == 0:
                 return False
-            write_wav(tmp_path, samples, sample_rate)
-            finalize(tmp_path, out_path, matcher_for(lang, gender), 0, 0)
+            natural = len(samples) / float(sr)
+            speed = 1.0
+
+            # Fit the slot with the engine's own rate control first — a native
+            # speed change keeps the timbre intact, atempo does not.
+            if slot_ms and natural > 0:
+                target = (slot_ms / 1000.0) * (1.0 + rate_pct / 100.0)
+                if natural > target * 1.05 and eng.name != "espeak":
+                    speed = float(np.clip(natural / target, 1.0, MAX_NATIVE_SPEEDUP))
+                    faster = eng.render(text, lang, gender, wpm, speed, voice)
+                    if faster is not None and len(faster[0]) > 0:
+                        samples, sr = faster
+
+            write_wav(tmp_path, samples, sr)
+            eng.fit_and_polish(tmp_path, out_path, slot_ms, rate_pct)
             return os.path.exists(out_path) and os.path.getsize(out_path) > 512
         finally:
             try:
@@ -323,7 +451,7 @@ def main() -> None:
                 pass
 
     if args.one:
-        ok = synth_item({"i": 0, "text": args.one, "out": args.out, "lang": args.lang, "gender": args.gender})
+        ok = synth_item({"i": 0, "text": args.one, "out": args.out, "lang": args.lang, "gender": args.gender, "voice": args.voice})
         print("OK 0" if ok else "FAIL 0", flush=True)
         return
 
@@ -333,11 +461,12 @@ def main() -> None:
     with open(args.manifest, encoding="utf-8") as f:
         items = json.load(f)
 
+    print(f"ENGINE {pick_engine(args, items[0].get('voice', '') if items else '')}", file=sys.stderr, flush=True)
     ok = fail = 0
     for item in items:
         try:
             good = synth_item(item)
-        except Exception as e:  # never let one line kill the batch
+        except Exception as e:
             print(f"ERR {item.get('i')}: {e}", file=sys.stderr, flush=True)
             good = False
         if good:

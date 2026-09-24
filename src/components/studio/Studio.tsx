@@ -36,9 +36,12 @@ import {
 } from "./panels";
 import {
   installPreset,
+  PROVIDERS,
   translateSegmentsInBrowser,
+  translateWithAi,
   type ModelPresetInfo,
   type PresetProgress,
+  type Provider,
 } from "@/lib/browserAssist";
 
 /* ------------------------------------------------------------------ */
@@ -109,6 +112,12 @@ export function Studio() {
   const [installingId, setInstallingId] = useState<string | null>(null);
   const [installLabel, setInstallLabel] = useState<string | null>(null);
   const [modelsError, setModelsError] = useState<string | null>(null);
+  const [activeEngine, setActiveEngine] = useState<string | null>(null);
+  const [testing, setTesting] = useState<"tts" | "asr" | null>(null);
+  const [testResult, setTestResult] = useState<string | null>(null);
+  const [testAudioUrl, setTestAudioUrl] = useState<string | null>(null);
+  const [aiProvider, setAiProvider] = useState<Provider>("groq");
+  const [aiKey, setAiKey] = useState("");
   const [askingTranscribe, setAskingTranscribe] = useState(false);
   const [translating, setTranslating] = useState(false);
   const [transLabel, setTransLabel] = useState<string | null>(null);
@@ -170,6 +179,7 @@ export function Studio() {
       const r = await fetch("/api/models");
       const d = await r.json();
       setPresets(d.presets ?? []);
+      setActiveEngine(d.active?.engine ?? null);
     } catch {
       /* ignore */
     }
@@ -178,6 +188,15 @@ export function Studio() {
   useEffect(() => {
     if (job?.status === "awaiting_transcript") void loadModels();
   }, [job?.status, loadModels]);
+
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem("dubforge.aiKey");
+      if (saved) setAiKey(saved);
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   async function installModel(preset: ModelPresetInfo) {
     setInstallingId(preset.id);
@@ -193,6 +212,38 @@ export function Studio() {
     } finally {
       setInstallingId(null);
       setInstallLabel(null);
+    }
+  }
+
+  async function runSelfTest(kind: "tts" | "asr") {
+    setTesting(kind);
+    setTestResult(null);
+    setTestAudioUrl(null);
+    try {
+      const r = await fetch("/api/models/selftest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          kind,
+          lang: job?.targetLang ?? "hi",
+          gender: (job?.voiceId ?? "").includes("Swara") || /Neural$/.test(job?.voiceId ?? "") ? "F" : "M",
+        }),
+      });
+      if (kind === "tts") {
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? "Voice test failed");
+        const engine = r.headers.get("x-engine") ?? "engine";
+        const blob = await r.blob();
+        setTestAudioUrl(URL.createObjectURL(blob));
+        setTestResult(`Voice test passed — rendered by ${engine}. Listen above; if it sounds right, your dub will too.`);
+      } else {
+        const d = await r.json();
+        if (!d.ok) throw new Error(d.error ?? "Transcription test failed");
+        setTestResult(`Transcription test passed with ${d.model} (${d.language ?? "?"}). Whisper heard: “${d.text}”`);
+      }
+    } catch (e) {
+      setTestResult(`Test failed — ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setTesting(null);
     }
   }
 
@@ -219,6 +270,48 @@ export function Studio() {
     segments.length > 0 &&
     (job?.sourceLang ?? "auto") !== job?.targetLang &&
     segments.some((s) => !s.translatedText || s.translatedText.trim() === s.sourceText.trim());
+
+  async function translateWithKey() {
+    if (!job) return;
+    const provider = PROVIDERS.find((p) => p.id === aiProvider);
+    if (!provider) return;
+    if (!aiKey.trim()) {
+      setUiError("Paste an API key first — it stays in your browser and is sent only to the provider.");
+      return;
+    }
+    setTranslating(true);
+    setUiError(null);
+    try {
+      window.localStorage.setItem("dubforge.aiKey", aiKey.trim());
+      const src = (job.detectedLang || job.sourceLang || "en").slice(0, 2);
+      setTransLabel("TRANSLATING WITH AI…");
+      const map = await translateWithAi(
+        segments.map((s) => ({ id: s.id, sourceText: s.sourceText, slotMs: Math.max(0, s.endMs - s.startMs) })),
+        src,
+        job.targetLang,
+        provider,
+        aiKey.trim(),
+      );
+      if (map.size > 0) {
+        await fetch(`/api/jobs/${job.id}`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            segments: [...map].map(([id, translatedText]) => ({ id, translatedText })),
+          }),
+        });
+        setTransLabel(`TRANSLATED ${map.size}/${segments.length}`);
+      } else {
+        setUiError("The AI provider returned no usable lines.");
+      }
+      await fetchJob(job.id);
+    } catch (e) {
+      setUiError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setTranslating(false);
+      setTimeout(() => setTransLabel(null), 2500);
+    }
+  }
 
   async function translateInBrowser() {
     if (!job) return;
@@ -544,6 +637,11 @@ export function Studio() {
                 onContinue={() => void resumeTranscribe()}
                 busy={askingTranscribe || installingId !== null}
                 error={modelsError}
+                activeEngine={activeEngine}
+                onTest={(k) => void runSelfTest(k)}
+                testing={testing}
+                testResult={testResult}
+                testAudioUrl={testAudioUrl}
               />
               <div className="flex flex-col gap-5">
                 <StageTracker job={job} />
@@ -624,21 +722,53 @@ export function Studio() {
             </div>
 
             {needsTranslation && (
-              <div className="mb-6 flex flex-wrap items-center gap-4 rounded-2xl border border-warm/30 bg-warm/[0.06] px-5 py-4">
-                <Languages className="h-5 w-5 shrink-0 text-warm" />
-                <div className="min-w-0 flex-1 text-[13px] leading-relaxed text-zinc-300">
-                  These lines are still in the source language. This machine has no route to a
-                  translation API, but your browser does — translate them here, edit anything you
-                  like, then approve.
+              <div className="mb-6 flex flex-col gap-4 rounded-2xl border border-warm/30 bg-warm/[0.06] px-5 py-4">
+                <div className="flex flex-wrap items-center gap-3">
+                  <Languages className="h-5 w-5 shrink-0 text-warm" />
+                  <div className="min-w-0 flex-1 text-[13px] leading-relaxed text-zinc-300">
+                    These lines are still in the source language. For a broadcast-quality dub, use an
+                    AI translator — it keeps context across lines and keeps every line short enough to
+                    fit its time slot.
+                  </div>
+                  <button
+                    onClick={() => void translateInBrowser()}
+                    disabled={translating}
+                    className="flex items-center gap-2 rounded-xl border border-white/15 bg-white/[0.06] px-4 py-2 text-[12.5px] font-semibold text-zinc-200 transition hover:bg-white/[0.12] disabled:opacity-40"
+                  >
+                    Free (machine)
+                  </button>
                 </div>
-                <button
-                  onClick={() => void translateInBrowser()}
-                  disabled={translating}
-                  className="flex items-center gap-2 rounded-xl border border-warm/40 bg-warm/[0.1] px-4 py-2 text-[12.5px] font-semibold text-warm transition hover:bg-warm/[0.18] disabled:opacity-40"
-                >
-                  {translating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wand2 className="h-3.5 w-3.5" />}
-                  {transLabel ?? "Translate in my browser"}
-                </button>
+
+                <div className="flex flex-wrap items-center gap-3 border-t border-white/[0.07] pt-4">
+                  <select
+                    value={aiProvider}
+                    onChange={(e) => setAiProvider(e.target.value as Provider)}
+                    className="rounded-xl border border-edge bg-ink/80 px-3 py-2 text-[12.5px] text-zinc-200"
+                  >
+                    {PROVIDERS.map((p) => (
+                      <option key={p.id} value={p.id}>{p.label}</option>
+                    ))}
+                  </select>
+                  <input
+                    type="password"
+                    value={aiKey}
+                    onChange={(e) => setAiKey(e.target.value)}
+                    placeholder={`API key (${PROVIDERS.find((p) => p.id === aiProvider)?.keyHint ?? "sk-…"})`}
+                    className="min-w-[16rem] flex-1 rounded-xl border border-edge bg-ink/80 px-3 py-2 text-[12.5px] text-zinc-200 placeholder:text-zinc-600"
+                  />
+                  <button
+                    onClick={() => void translateWithKey()}
+                    disabled={translating}
+                    className="flex items-center gap-2 rounded-xl border border-warm/40 bg-warm/[0.12] px-4 py-2 text-[12.5px] font-semibold text-warm transition hover:bg-warm/[0.2] disabled:opacity-40"
+                  >
+                    {translating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wand2 className="h-3.5 w-3.5" />}
+                    {transLabel ?? "Translate with AI"}
+                  </button>
+                </div>
+                <p className="font-mono text-[9px] tracking-[0.14em] text-zinc-600">
+                  KEY STAYS IN YOUR BROWSER (LOCALSTORAGE) · SENT ONLY TO THE PROVIDER YOU PICK ·
+                  GET ONE AT {PROVIDERS.find((p) => p.id === aiProvider)?.keyUrl.toUpperCase()}
+                </p>
               </div>
             )}
 

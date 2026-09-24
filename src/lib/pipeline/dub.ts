@@ -13,7 +13,7 @@ import {
 } from "@/lib/fftools";
 import { jobDir } from "@/lib/storage";
 import { defaultVoiceFor, voiceById } from "@/lib/voices";
-import { findLocalPiperVoice, findLocalWhisperModel } from "@/lib/models";
+import { findLocalKokoro, findLocalPiperVoice, findLocalWhisperModel, kokoroVoiceFor } from "@/lib/models";
 import { translateAll } from "./translate";
 
 /* ------------------------------------------------------------------ */
@@ -47,7 +47,7 @@ function canReachHf(): Promise<boolean> {
   return hfReachable;
 }
 
-type TtsEngine = "edge" | "piper" | "offline";
+type TtsEngine = "edge" | "kokoro" | "piper" | "offline";
 
 /**
  * auto  -> online neural voice when reachable, else Piper, else the built-in
@@ -56,11 +56,14 @@ type TtsEngine = "edge" | "piper" | "offline";
 async function resolveTtsEngine(job: JobRow): Promise<TtsEngine> {
   const forced = (process.env.TTS_ENGINE ?? "auto").toLowerCase();
   const gender = voiceById(job.voiceId)?.gender ?? "M";
+  const kokoro = findLocalKokoro();
   const piper = findLocalPiperVoice(job.targetLang, gender);
   if (forced === "edge") return "edge";
-  if (forced === "offline") return piper ? "piper" : "offline";
+  if (forced === "kokoro") return kokoro ? "kokoro" : piper ? "piper" : "offline";
   if (forced === "piper") return piper ? "piper" : "offline";
+  if (forced === "offline") return kokoro ? "kokoro" : piper ? "piper" : "offline";
   if (await canReachEdgeTts()) return "edge";
+  if (kokoro) return "kokoro";
   return piper ? "piper" : "offline";
 }
 
@@ -464,17 +467,23 @@ async function stageSynthesize(job: JobRow, dir: string) {
   const pitch = fmtSigned(job.pitchHz, "Hz");
 
   const engine = await resolveTtsEngine(job);
-  const piperModel =
-    engine === "piper" ? findLocalPiperVoice(job.targetLang, voice?.gender ?? "M") : null;
+  const gender = voice?.gender ?? "M";
+  const piperModel = engine === "piper" ? findLocalPiperVoice(job.targetLang, gender) : null;
+  const kokoro = engine === "kokoro" ? findLocalKokoro() : null;
+  // Kokoro voices are picked by language + gender; Piper by the installed voice.
+  const synthVoice =
+    engine === "kokoro" ? kokoroVoiceFor(job.targetLang, gender) : engine === "piper" ? "" : voiceId;
   const profilePath = path.join(dir, "voice_profile.json");
   const hasProfile = job.voiceMatch && fs.existsSync(profilePath);
 
   const engineLabel =
     engine === "edge"
       ? `Edge neural voice ${voiceId}`
-      : engine === "piper"
-        ? `Piper neural voice ${piperModel ? path.basename(piperModel) : job.targetLang}`
-        : `built-in offline voice (${job.targetLang}, ${voice?.gender === "F" ? "female" : "male"})`;
+      : engine === "kokoro"
+        ? `Kokoro-82M neural voice ${synthVoice}`
+        : engine === "piper"
+          ? `Piper neural voice ${piperModel ? path.basename(piperModel) : job.targetLang}`
+          : `built-in offline voice (${job.targetLang}, ${gender === "F" ? "female" : "male"})`;
 
   await setProgress(job.id, "synthesize", 56, `TTS: ${engineLabel} — ${segs.length} lines`);
   await addLog(
@@ -489,11 +498,12 @@ async function stageSynthesize(job: JobRow, dir: string) {
     .map((s) => ({
       i: s.idx,
       text: (s.translatedText ?? s.sourceText).trim(),
-      voice: voiceId,
+      voice: synthVoice,
       lang: job.targetLang,
-      gender: voice?.gender ?? "M",
+      gender,
       rate,
       pitch,
+      slotMs: Math.max(0, s.endMs - s.startMs),
       out: path.join(segDir, `seg_${s.idx}.mp3`),
     }))
     .filter((it) => it.text.length > 0);
@@ -509,8 +519,10 @@ async function stageSynthesize(job: JobRow, dir: string) {
       : [
           path.join(SCRIPTS, "offline_tts.py"),
           "--manifest", manifest,
+          "--engine", engine === "piper" ? "piper" : engine === "kokoro" ? "kokoro" : "espeak",
           ...(hasProfile ? ["--profile", profilePath] : []),
           ...(piperModel ? ["--piper-model", piperModel] : []),
+          ...(kokoro ? ["--kokoro-model", kokoro.model, "--kokoro-voices", kokoro.voices] : []),
         ];
   const res = await run(
     PY,
@@ -553,10 +565,12 @@ async function stageSynthesize(job: JobRow, dir: string) {
     }
     const slotMs = Math.max(500, s.endMs - s.startMs);
     const ratio = ttsMs / slotMs;
-    // Dynamic tempo: compress if the reading overflows, mildly stretch if too short
+    // The TTS worker already fits each line to its slot (native rate first, then
+    // atempo), so only a small residual correction is applied here — stacking two
+    // big atempo passes is what makes machine dubs sound sped-up.
     let tempo = 1;
-    if (ratio > 1.05) tempo = Math.min(1.45, ratio);
-    else if (ratio < 0.8 && ttsMs > 600) tempo = Math.max(0.85, ratio);
+    if (ratio > 1.1) tempo = Math.min(1.12, ratio);
+    else if (ratio < 0.75 && ttsMs > 600) tempo = Math.max(0.9, ratio);
 
     const af = tempo !== 1 ? ["-af", `atempo=${tempo.toFixed(4)}`] : [];
     try {
@@ -607,7 +621,15 @@ async function stageMux(job: JobRow, dir: string) {
     grp.forEach((s, k) => {
       inputs.push("-i", s.audioPath!);
       const d = Math.max(0, s.startMs - winStart);
-      filterParts.push(`[${k}:a]aresample=24000,asetpts=PTS-STARTPTS,adelay=${d}|${d}[s${k}]`);
+      // 12 ms fades on both edges: hard-cut TTS clips click when they are mixed
+      // into a timeline, and clicks are the first thing people notice in a dub.
+      const clipSec = Math.max(0.05, ((s.ttsMs ?? 1000) / (s.tempo ?? 1)) / 1000);
+      const fadeOut = Math.max(0, clipSec - 0.012);
+      filterParts.push(
+        `[${k}:a]aresample=24000,asetpts=PTS-STARTPTS,` +
+          `afade=t=in:st=0:d=0.012,afade=t=out:st=${fadeOut.toFixed(3)}:d=0.012,` +
+          `adelay=${d}|${d}[s${k}]`,
+      );
     });
     const mixIn = grp.map((_, k) => `[s${k}]`).join("");
     filterParts.push(
@@ -631,15 +653,27 @@ async function stageMux(job: JobRow, dir: string) {
     await setProgress(job.id, "sync", 84 + ((w + 1) / windows.length) * 8, `Mixing window ${w + 1}/${windows.length}`);
   }
 
-  // Concatenate windows into the full dubbed track
-  const dubWav = path.join(dir, "dub_track.wav");
+  // Concatenate windows into the full dubbed track, then lift it to a
+  // consistent broadcast level at 48 kHz (AAC from a 24 kHz source sounds dull).
+  const joined = path.join(dir, "dub_joined.wav");
   if (winFiles.length === 1) {
-    fs.copyFileSync(winFiles[0], dubWav);
+    fs.copyFileSync(winFiles[0], joined);
   } else {
     const listPath = path.join(dir, "concat.txt");
     fs.writeFileSync(listPath, winFiles.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n"));
-    await runChecked(FFMPEG, ["-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c:a", "copy", dubWav], { killAfterMs: 30 * 60_000 });
+    await runChecked(FFMPEG, ["-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c:a", "copy", joined], { killAfterMs: 30 * 60_000 });
   }
+  const dubWav = path.join(dir, "dub_track.wav");
+  await runChecked(
+    FFMPEG,
+    [
+      "-y", "-i", joined,
+      "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+      "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le",
+      dubWav,
+    ],
+    { killAfterMs: 60 * 60_000 },
+  );
 
   // Final multiplex — video stream copied untouched, NO watermark, ever.
   await setProgress(job.id, "sync", 94, "Multiplexing final MP4…");
@@ -657,7 +691,7 @@ async function stageMux(job: JobRow, dir: string) {
   }
   mixArgs.push(
     "-c:v", "copy",
-    "-c:a", "aac", "-b:a", "160k",
+    "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
     "-t", String(job.durationSec ?? 0),
     "-movflags", "+faststart",
     outputPath,

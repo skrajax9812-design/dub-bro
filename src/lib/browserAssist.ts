@@ -157,3 +157,122 @@ export async function translateSegmentsInBrowser(
   await Promise.all(new Array(Math.min(4, total)).fill(0).map(worker));
   return out;
 }
+
+/* ------------------------------------------------------------------ */
+/* AI translation (visitor's own API key, called from the browser)      */
+/* ------------------------------------------------------------------ */
+
+export type Provider = "groq" | "openai";
+
+export interface ProviderInfo {
+  id: Provider;
+  label: string;
+  keyHint: string;
+  url: string;
+  model: string;
+  keyUrl: string;
+}
+
+export const PROVIDERS: ProviderInfo[] = [
+  {
+    id: "groq",
+    label: "Groq (fast + free tier)",
+    keyHint: "gsk_…",
+    url: "https://api.groq.com/openai/v1/chat/completions",
+    model: "llama-3.3-70b-versatile",
+    keyUrl: "https://console.groq.com/keys",
+  },
+  {
+    id: "openai",
+    label: "OpenAI",
+    keyHint: "sk-…",
+    url: "https://api.openai.com/v1/chat/completions",
+    model: "gpt-4o-mini",
+    keyUrl: "https://platform.openai.com/api-keys",
+  },
+];
+
+const LANG_NAMES: Record<string, string> = {
+  hi: "Hindi", en: "English", es: "Spanish", fr: "French", de: "German", it: "Italian",
+  pt: "Portuguese", ru: "Russian", ja: "Japanese", ko: "Korean", zh: "Chinese", ar: "Arabic",
+  bn: "Bengali", ta: "Tamil", te: "Telugu", mr: "Marathi", gu: "Gujarati", kn: "Kannada",
+  ml: "Malayalam", pa: "Punjabi", ur: "Urdu",
+};
+
+export interface AiLine {
+  id: string;
+  sourceText: string;
+  slotMs: number;
+}
+
+/**
+ * Context-aware dubbing translation: the whole transcript goes to the model in
+ * one request so it keeps pronouns, names and tone consistent, and every line is
+ * asked to stay close to its spoken length (= the time slot it must fit into).
+ */
+export async function translateWithAi(
+  lines: AiLine[],
+  src: string,
+  tgt: string,
+  provider: ProviderInfo,
+  apiKey: string,
+  signal?: AbortSignal,
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (lines.length === 0) return out;
+
+  const srcName = LANG_NAMES[src] ?? src;
+  const tgtName = LANG_NAMES[tgt] ?? tgt;
+  const BATCH = 40;
+
+  for (let start = 0; start < lines.length; start += BATCH) {
+    const batch = lines.slice(start, start + BATCH);
+    const payload = batch.map((l) => ({
+      id: l.id,
+      text: l.sourceText,
+      max_chars: Math.max(24, Math.round((l.slotMs / 1000) * 13.5)),
+    }));
+
+    const prompt = [
+      `You are a professional dubbing translator. Translate every line from ${srcName} to ${tgtName}.`,
+      `This is spoken dialogue for a video dub, so it must sound natural when read aloud.`,
+      `Rules:`,
+      `1. Keep the meaning, tone and names exactly; never add or drop information.`,
+      `2. Each line must fit its time slot: stay at or under max_chars characters, because the`,
+      `   line is read aloud in that many milliseconds. Shorten wording rather than dropping meaning.`,
+      `3. Keep line count and ids identical, in order.`,
+      `4. Output ONLY a JSON object: {"<id>": "<translation>", ...}. No markdown, no notes.`,
+      JSON.stringify(payload),
+    ].join("\n");
+
+    const res = await fetch(provider.url, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: provider.model,
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.2,
+        max_tokens: 4000,
+        response_format: { type: "json_object" },
+      }),
+      signal,
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`${provider.label} → HTTP ${res.status}${detail ? `: ${detail.slice(0, 160)}` : ""}`);
+    }
+    const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+    const raw = data.choices?.[0]?.message?.content ?? "{}";
+    let parsed: Record<string, string> = {};
+    try {
+      parsed = JSON.parse(raw.replace(/```json|```/g, "").trim()) as Record<string, string>;
+    } catch {
+      parsed = {};
+    }
+    for (const l of batch) {
+      const value = parsed[l.id];
+      if (typeof value === "string" && value.trim()) out.set(l.id, value.trim());
+    }
+  }
+  return out;
+}

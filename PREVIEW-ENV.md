@@ -79,15 +79,35 @@ of the pipeline have offline paths:
 | --- | --- | --- |
 | Speech recognition | Faster-Whisper (downloads from HF) | model installed from the **Studio** → runs locally |
 | Translation | Groq / OpenAI / MyMemory (server) | the visitor's browser (CORS-enabled MT API) or manual edits in review |
-| Voice | Edge-TTS neural voice | Piper voice if installed, else bundled espeak-ng |
+| Voice | Edge-TTS neural voice | Kokoro-82M → Piper → bundled espeak-ng |
 | Voice cloning | — | `scripts/voice_profile.py` + `scripts/offline_tts.py` match the dub's pitch and tone to the speaker in the source video |
 
-**Bring your own model.** `GET /api/models` lists presets (Whisper tiny/base/small,
-Piper Hindi voices). The browser downloads those files from Hugging Face and
+**Quality ladder.** The pipeline picks the best engine it can actually run:
+Kokoro-82M (best) → Piper (very good) → espeak-ng (fallback). `/api/models` reports
+`active.engine`, and `TTS_ENGINE=kokoro|piper|edge|offline|auto` can pin it.
+`POST /api/models/selftest {kind:"tts"|"asr"}` renders a sample sentence (audio comes
+back) or runs a round-trip transcription, so a broken model download is caught before
+a dub starts.
+
+**Bring your own model.** `GET /api/models` lists presets (Whisper tiny/base/small/medium,
+Kokoro-82M Hindi, Piper Hindi voices). The browser downloads those files from Hugging Face and
 streams them into `data/models` with `POST /api/models/upload`
 (headers `x-rel-path` + `x-offset`, raw chunk body, 8 MB chunks). Everything
 afterwards runs locally: `src/lib/models.ts` finds the installed model and the
 pipeline uses it automatically.
+
+**Timing.** Each line is fitted to its own time slot with the engine's *native* rate
+control first (Kokoro speed / Piper length_scale) and only then atempo — stacking big
+atempo passes is what makes machine dubs sound sped-up. The pipeline applies just a
+±12% residual correction.
+
+**Mixing.** 12 ms fades on every segment edge (no clicks), the dub track is normalised
+to -16 LUFS / -1.5 dBTP at 48 kHz, and the final mux copies the video stream and writes
+192 kbps AAC. `mixOriginal` keeps the source audio at 10 % as ambience.
+
+**Translation.** With a Groq/OpenAI key pasted in the Studio the *browser* translates
+(context-aware, one request per 40 lines, each line asked to fit its time slot). Without
+a key it falls back to a free CORS MT API, and any line can still be hand-edited.
 
 Flow states: `awaiting_transcript` (no Whisper yet — the Studio offers the
 one-click install, then `PATCH {action:"transcribe"}`) and `awaiting_review`

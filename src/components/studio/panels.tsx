@@ -549,6 +549,11 @@ export function ModelSetup({
   onContinue,
   busy,
   error,
+  activeEngine,
+  onTest,
+  testing,
+  testResult,
+  testAudioUrl,
 }: {
   presets: ModelPresetInfo[];
   installedAsr: string | null;
@@ -558,6 +563,11 @@ export function ModelSetup({
   onContinue: () => void;
   busy: boolean;
   error: string | null;
+  activeEngine: string | null;
+  onTest: (kind: "tts" | "asr") => void;
+  testing: "tts" | "asr" | null;
+  testResult: string | null;
+  testAudioUrl: string | null;
 }) {
   const asr = presets.filter((p) => p.kind === "asr");
   const tts = presets.filter((p) => p.kind === "tts");
@@ -612,8 +622,43 @@ export function ModelSetup({
         {asr.map(row)}
       </div>
       <div className="flex flex-col gap-2.5">
-        <div className="font-mono text-[9px] tracking-[0.25em] text-zinc-500">NEURAL VOICE (OPTIONAL, BETTER QUALITY)</div>
+        <div className="font-mono text-[9px] tracking-[0.25em] text-zinc-500">
+          NEURAL VOICE — QUALITY LADDER (KOKORO &gt; PIPER &gt; BUILT-IN)
+        </div>
         {tts.map(row)}
+      </div>
+
+      <div className="rounded-2xl border border-edge bg-ink/40 p-4">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="font-mono text-[9px] tracking-[0.22em] text-zinc-500">ACTIVE ENGINE</div>
+            <div className="mt-1 font-display text-[13.5px] font-semibold text-white">
+              {activeEngine ? activeEngine.toUpperCase() : "DETECTING…"}
+            </div>
+          </div>
+          <button
+            onClick={() => onTest("tts")}
+            disabled={testing !== null}
+            className="flex items-center gap-2 rounded-xl border border-white/15 bg-white/[0.06] px-3.5 py-2 text-[12px] font-semibold text-zinc-200 transition hover:bg-white/[0.12] disabled:opacity-40"
+          >
+            {testing === "tts" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+            Test voice
+          </button>
+          <button
+            onClick={() => onTest("asr")}
+            disabled={testing !== null || !installedAsr}
+            className="flex items-center gap-2 rounded-xl border border-white/15 bg-white/[0.06] px-3.5 py-2 text-[12px] font-semibold text-zinc-200 transition hover:bg-white/[0.12] disabled:opacity-40"
+          >
+            {testing === "asr" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Mic className="h-3.5 w-3.5" />}
+            Test transcription
+          </button>
+        </div>
+        {testResult && (
+          <div className="mt-3 text-[11.5px] leading-relaxed text-zinc-400">{testResult}</div>
+        )}
+        {testAudioUrl && (
+          <audio className="mt-3 w-full" controls src={testAudioUrl} />
+        )}
       </div>
       {error && (
         <div className="flex items-start gap-3 rounded-2xl border border-red-400/30 bg-red-400/[0.07] px-4 py-3 text-[12.5px] text-red-200">
