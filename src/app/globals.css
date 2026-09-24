@@ -1,0 +1,228 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-sg), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jb), ui-monospace, SFMono-Regular, monospace;
+
+  --color-void: #050508;
+  --color-ink: #0a0a12;
+  --color-panel: #0d0d17;
+  --color-edge: rgba(255, 255, 255, 0.08);
+  --color-neon: #8b7cff;
+  --color-ice: #42e8ff;
+  --color-mint: #4dffb8;
+  --color-warm: #ff8a5c;
+
+  --animate-marquee: marquee 40s linear infinite;
+  --animate-pulse-soft: pulseSoft 2.6s ease-in-out infinite;
+  --animate-float: floaty 9s ease-in-out infinite;
+  --animate-scan: scan 2.4s linear infinite;
+  --animate-blink: blink 1s steps(2) infinite;
+  --animate-spin-slow: spin 14s linear infinite;
+
+  @keyframes marquee {
+    from { transform: translateX(0); }
+    to { transform: translateX(-50%); }
+  }
+  @keyframes pulseSoft {
+    0%, 100% { opacity: 0.55; }
+    50% { opacity: 1; }
+  }
+  @keyframes floaty {
+    0%, 100% { transform: translateY(0px) rotate(var(--fr, 0deg)); }
+    50% { transform: translateY(-16px) rotate(var(--fr, 0deg)); }
+  }
+  @keyframes scan {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(220%); }
+  }
+  @keyframes blink {
+    50% { opacity: 0; }
+  }
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--color-void);
+  color: #eceef6;
+  overflow-x: hidden;
+}
+
+::selection {
+  background: rgba(139, 124, 255, 0.45);
+  color: #fff;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: #07070d;
+}
+::-webkit-scrollbar-thumb {
+  background: #26263a;
+  border-radius: 99px;
+  border: 2px solid #07070d;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3b3b58;
+}
+
+/* ---------- bespoke utilities ---------- */
+
+.text-gradient {
+  background: linear-gradient(100deg, #b8adff 0%, #8b7cff 30%, #42e8ff 75%, #9df2ff 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.glass {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.015));
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(14px);
+}
+
+.card-hover {
+  transition: transform 0.45s cubic-bezier(0.22, 1, 0.36, 1), border-color 0.45s, box-shadow 0.45s;
+}
+.card-hover:hover {
+  transform: translateY(-4px);
+  border-color: rgba(139, 124, 255, 0.45);
+  box-shadow: 0 24px 60px -24px rgba(139, 124, 255, 0.35);
+}
+
+.glow-conic {
+  position: relative;
+}
+.glow-conic::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  padding: 1px;
+  background: conic-gradient(from 140deg, transparent 20%, rgba(139, 124, 255, 0.65), rgba(66, 232, 255, 0.5), transparent 80%);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+.btn-primary {
+  background: linear-gradient(100deg, #7c6cff, #42b8ff);
+  box-shadow: 0 8px 32px -8px rgba(124, 108, 255, 0.75), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  transition: transform 0.3s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.3s, filter 0.3s;
+}
+.btn-primary:hover {
+  transform: translateY(-2px);
+  filter: brightness(1.08);
+  box-shadow: 0 16px 44px -10px rgba(124, 108, 255, 0.9), inset 0 1px 0 rgba(255, 255, 255, 0.3);
+}
+.btn-primary:active {
+  transform: translateY(0px) scale(0.985);
+}
+.btn-primary:disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.grain::after {
+  content: "";
+  position: fixed;
+  inset: -50%;
+  z-index: 60;
+  pointer-events: none;
+  opacity: 0.05;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 250 250' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.72' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+.grid-bg {
+  background-image:
+    linear-gradient(rgba(139, 124, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(139, 124, 255, 0.05) 1px, transparent 1px);
+  background-size: 54px 54px;
+  mask-image: radial-gradient(ellipse 90% 70% at 50% 30%, #000 30%, transparent 75%);
+}
+
+.strike-30 {
+  position: relative;
+  display: inline-block;
+}
+.strike-30::after {
+  content: "";
+  position: absolute;
+  left: -6%;
+  right: -6%;
+  top: 52%;
+  height: 0.09em;
+  border-radius: 99px;
+  background: linear-gradient(90deg, transparent, #ff5c7a 12%, #ff5c7a 88%, transparent);
+  transform: rotate(-4deg);
+  box-shadow: 0 0 24px rgba(255, 92, 122, 0.65);
+}
+
+.progress-shimmer {
+  position: relative;
+  overflow: hidden;
+}
+.progress-shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.35), transparent);
+  animation: scan 1.6s linear infinite;
+}
+
+/* range sliders */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 99px;
+  background: linear-gradient(90deg, rgba(139, 124, 255, 0.7) var(--fill, 50%), rgba(255, 255, 255, 0.1) var(--fill, 50%));
+  outline: none;
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  border: 3px solid #8b7cff;
+  box-shadow: 0 0 0 4px rgba(139, 124, 255, 0.18), 0 2px 10px rgba(0, 0, 0, 0.5);
+  transition: transform 0.15s;
+}
+input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+}
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  border: 3px solid #8b7cff;
+}
+
+select {
+  color-scheme: dark;
+}
+
+textarea,
+input[type="text"],
+select {
+  outline: none;
+}
+textarea:focus-visible,
+input[type="text"]:focus-visible,
+select:focus-visible {
+  border-color: rgba(139, 124, 255, 0.55) !important;
+  box-shadow: 0 0 0 3px rgba(139, 124, 255, 0.15);
+}
