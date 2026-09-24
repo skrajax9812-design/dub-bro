@@ -246,7 +246,10 @@ export function Studio() {
   /* Auto-pilot: fetch the models itself, then let the job run to the end */
   /* ------------------------------------------------------------------ */
 
-  const AUTO_ORDER = ["whisper-base", "xtts-v2", "whisper-small", "kokoro-hi", "piper-hi-male"];
+  // What auto-pilot fetches on its own, in order: a transcript model, the voice
+  // clone the user asked for, and one neural Hindi voice as a safety net.
+  // The bigger extras (whisper-small, Piper) stay one click away in the panel.
+  const AUTO_ORDER = ["whisper-base", "xtts-v2", "kokoro-hi"];
 
   useEffect(() => {
     if (!autoPilot || installingId || presets.length === 0) return;
