@@ -168,15 +168,48 @@ export function safeModelPath(relPath: string): string {
   return abs;
 }
 
+/**
+ * True byte count of every file the browser has finished streaming in. The
+ * registry sizes are estimates (a Hugging Face file is rarely a round number),
+ * so a finished transfer records its real length here — otherwise a 99.9 %
+ * "complete" file would be re-downloaded forever, or a truncated one accepted.
+ */
+function installedManifestPath(): string {
+  return path.join(modelsRoot(), ".installed.json");
+}
+
+export function readInstalledManifest(): Record<string, number> {
+  try {
+    const raw = JSON.parse(fs.readFileSync(installedManifestPath(), "utf8")) as Record<string, number>;
+    return raw && typeof raw === "object" ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+export function markFileInstalled(dest: string, bytes: number): void {
+  const map = readInstalledManifest();
+  map[dest] = bytes;
+  fs.mkdirSync(modelsRoot(), { recursive: true });
+  fs.writeFileSync(installedManifestPath(), JSON.stringify(map));
+}
+
 export function modelFileStatus(f: ModelFile): { dest: string; bytes: number; complete: boolean } {
   const abs = safeModelPath(f.dest);
+  const marked = readInstalledManifest()[f.dest];
+  let size = 0;
   try {
-    const st = fs.statSync(abs);
-    // LFS-ish tolerance: consider it complete once we have ~90% of the expected size.
-    return { dest: f.dest, bytes: st.size, complete: st.size >= f.bytes * 0.9 };
+    size = fs.statSync(abs).size;
   } catch {
-    return { dest: f.dest, bytes: 0, complete: false };
+    size = 0;
   }
+  if (marked !== undefined) {
+    // A finished transfer is authoritative — but only while the file is intact.
+    return { dest: f.dest, bytes: size, complete: size > 0 && size === marked };
+  }
+  // No record (model dropped in by hand, or installed before this manifest
+  // existed): fall back to the expected size, with a little slack for LFS.
+  return { dest: f.dest, bytes: size, complete: size >= f.bytes * 0.9 };
 }
 
 export function presetStatus(p: ModelPreset) {

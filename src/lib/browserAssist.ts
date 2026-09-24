@@ -16,7 +16,7 @@ export interface ModelFileInfo {
   file: string;
   /** Bytes already streamed into the sandbox (used to resume). */
   haveBytes: number;
-  /** Expected size of the finished file. */
+  /** Best-known size of the finished file (registry estimate until it lands). */
   totalBytes: number;
   complete: boolean;
 }
@@ -66,13 +66,16 @@ async function installFile(
   if (!res.body) throw new Error("This browser cannot stream downloads.");
 
   const remaining = Number(res.headers.get("content-length") ?? 0);
-  const total = resumed && remaining > 0 ? resumeAt + remaining : remaining || f.totalBytes;
+  // content-length is the truth; the registry size is only an estimate used for
+  // the progress bar and for presets installed by other means.
+  const realTotal = remaining > 0 ? (resumed ? resumeAt + remaining : remaining) : 0;
+  const total = realTotal || f.totalBytes;
   const reader = res.body.getReader();
   let offset = resumed ? resumeAt : 0;
   let pending: Uint8Array[] = [];
   let pendingBytes = 0;
 
-  const flush = async () => {
+  const flush = async (final = false) => {
     if (pendingBytes === 0) return;
     const chunk = new Uint8Array(pendingBytes);
     let at = 0;
@@ -84,7 +87,14 @@ async function installFile(
     pendingBytes = 0;
     const up = await fetch("/api/models/upload", {
       method: "POST",
-      headers: { "x-rel-path": f.dest, "x-offset": String(offset), "content-type": "application/octet-stream" },
+      headers: {
+        "x-rel-path": f.dest,
+        "x-offset": String(offset),
+        "content-type": "application/octet-stream",
+        // Tells the server "this is the whole file" so it can record the true
+        // size instead of trusting our estimate.
+        ...(final ? { "x-complete": "1" } : {}),
+      },
       body: chunk,
       signal,
     });
@@ -104,7 +114,20 @@ async function installFile(
       if (pendingBytes >= CHUNK_BYTES) await flush();
     }
   }
-  await flush();
+  await flush(true);
+
+  // Hugging Face answered with a known length and we stored a different number
+  // of bytes: the transfer was cut short. Wipe the file so the next attempt
+  // starts clean rather than writing a half-model over an old one.
+  if (realTotal > 0 && offset !== realTotal) {
+    await fetch("/api/models/upload", {
+      method: "POST",
+      headers: { "x-rel-path": f.dest, "x-reset": "1" },
+    });
+    throw new Error(
+      `${f.file} stored ${offset} of ${realTotal} bytes — restarting that file.`,
+    );
+  }
 }
 
 /** Install a whole preset (all of its files), resuming anything half-done. */

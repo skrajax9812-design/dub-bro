@@ -126,6 +126,7 @@ export function Studio() {
   const autoTranslatedRef = useRef<Set<string>>(new Set());
   const declinedRef = useRef<Set<string>>(new Set());
   const reDubRef = useRef<Set<string>>(new Set());
+  const installFailsRef = useRef<Map<string, number>>(new Map());
   const [askingTranscribe, setAskingTranscribe] = useState(false);
   const [translating, setTranslating] = useState(false);
   const [transLabel, setTransLabel] = useState<string | null>(null);
@@ -217,11 +218,23 @@ export function Studio() {
         const pct = p.total > 0 ? Math.round((p.received / p.total) * 100) : 0;
         setInstallLabel(`${p.fileLabel} — ${mb(p.received)} / ${mb(p.total)} MB (${pct}%)`);
       });
+      installFailsRef.current.delete(preset.id);
       await loadModels();
     } catch (e) {
-      // An interrupted download is fine — the next tick resumes it where it stopped.
       const msg = e instanceof Error ? e.message : String(e);
-      if (!silent || !/abort|network|Failed to fetch/i.test(msg)) setModelsError(msg);
+      // An interrupted download is fine — the next tick resumes it where it stopped.
+      const hardFail = !/abort/i.test(msg);
+      if (hardFail) {
+        const n = (installFailsRef.current.get(preset.id) ?? 0) + 1;
+        installFailsRef.current.set(preset.id, n);
+        if (n >= 3) {
+          setAutoNote(
+            `${preset.label} did not download after ${n} tries: ${msg} — ` +
+              "open the engine panel and press Install to retry.",
+          );
+        }
+      }
+      if (!silent || hardFail) setModelsError(msg);
     } finally {
       installingRef.current = null;
       setInstallingId(null);
@@ -238,7 +251,13 @@ export function Studio() {
   useEffect(() => {
     if (!autoPilot || installingId || presets.length === 0) return;
     const missing = presets
-      .filter((p) => !p.installed && AUTO_ORDER.includes(p.id) && !declinedRef.current.has(p.id))
+      .filter(
+        (p) =>
+          !p.installed &&
+          AUTO_ORDER.includes(p.id) &&
+          !declinedRef.current.has(p.id) &&
+          (installFailsRef.current.get(p.id) ?? 0) < 3,
+      )
       .sort((a, b) => AUTO_ORDER.indexOf(a.id) - AUTO_ORDER.indexOf(b.id));
     const next = missing[0];
     if (!next) return;
