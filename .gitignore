@@ -24,3 +24,10 @@ next-env.d.ts
 .DS_Store
 *.pem
 tsconfig.tsbuildinfo
+
+# python
+__pycache__/
+*.pyc
+
+# local model weights (installed via the browser, not source)
+/data/models/

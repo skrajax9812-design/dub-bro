@@ -48,7 +48,24 @@ export async function POST(req: NextRequest) {
     { killAfterMs: 45_000 },
   );
   if (res.code !== 0 || !fs.existsSync(out)) {
-    return NextResponse.json({ error: "Voice preview failed" }, { status: 502 });
+    // Edge-TTS is unreachable (sandbox / offline host) — fall back to the
+    // built-in offline voice so the preview button still works.
+    const offline = await run(
+      process.env.PYTHON_BIN || "python3",
+      [
+        path.join(process.cwd(), "scripts", "offline_tts.py"),
+        "--one", text,
+        "--lang", voice.lang,
+        "--gender", voice.gender,
+        "--rate", `${r >= 0 ? "+" : ""}${r}%`,
+        "--pitch", `${p >= 0 ? "+" : ""}${p}Hz`,
+        "--out", out,
+      ],
+      { killAfterMs: 60_000 },
+    );
+    if (offline.code !== 0 || !fs.existsSync(out) || fs.statSync(out).size < 512) {
+      return NextResponse.json({ error: "Voice preview failed" }, { status: 502 });
+    }
   }
   const buf = fs.readFileSync(out);
   fs.rmSync(out, { force: true });

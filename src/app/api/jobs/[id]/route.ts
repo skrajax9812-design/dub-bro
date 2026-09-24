@@ -65,7 +65,26 @@ export async function PATCH(req: NextRequest, { params }: Ctx) {
       .update(dubJobs)
       .set({ status: "queued", stage: "synthesize", updatedAt: new Date() })
       .where(eq(dubJobs.id, id));
-    enqueueJob(id, true);
+    enqueueJob(id, "review");
+    return NextResponse.json({ ok: true });
+  }
+
+  if (body.action === "transcribe") {
+    if (job.status !== "awaiting_transcript") {
+      return NextResponse.json({ error: "Job is not waiting for a transcript" }, { status: 409 });
+    }
+    await db
+      .update(dubJobs)
+      .set({
+        status: "queued",
+        stage: "transcribe",
+        progress: 6,
+        stageDetail: "Transcript requested — running speech recognition",
+        error: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(dubJobs.id, id));
+    enqueueJob(id, "transcribe");
     return NextResponse.json({ ok: true });
   }
 
@@ -84,7 +103,7 @@ export async function PATCH(req: NextRequest, { params }: Ctx) {
         updatedAt: new Date(),
       })
       .where(eq(dubJobs.id, id));
-    enqueueJob(id, false);
+    enqueueJob(id, "full");
     return NextResponse.json({ ok: true });
   }
 

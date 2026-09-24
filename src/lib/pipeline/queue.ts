@@ -1,8 +1,8 @@
-import { runPipeline } from "./dub";
+import { runPipeline, type JobMode } from "./dub";
 
 interface QItem {
   jobId: string;
-  fromReview: boolean;
+  mode: JobMode;
 }
 
 interface QStore {
@@ -24,7 +24,7 @@ async function pump() {
     while (store.items.length > 0) {
       const item = store.items.shift()!;
       try {
-        await runPipeline(item.jobId, { fromReview: item.fromReview });
+        await runPipeline(item.jobId, { mode: item.mode });
       } catch (e) {
         console.error(`[queue] pipeline crashed for ${item.jobId}`, e);
       }
@@ -34,10 +34,15 @@ async function pump() {
   }
 }
 
-export function enqueueJob(jobId: string, fromReview = false) {
-  // Avoid duplicates for the same job already waiting/running identical stage
-  const exists = store.items.some((i) => i.jobId === jobId && i.fromReview === fromReview);
-  if (!exists) store.items.push({ jobId, fromReview });
+/**
+ * mode:
+ *   full   — extract → transcribe → translate → synthesize → mux
+ *   review — the transcript was approved in the Studio, continue at synthesis
+ *   resume — the Studio supplied transcript/translations, continue at synthesis
+ */
+export function enqueueJob(jobId: string, mode: JobMode = "full") {
+  const exists = store.items.some((i) => i.jobId === jobId && i.mode === mode);
+  if (!exists) store.items.push({ jobId, mode });
   void pump();
 }
 

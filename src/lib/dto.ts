@@ -23,6 +23,7 @@ export function jobToDto(row: JobRow, opts: { withLog?: boolean } = {}): JobDto 
     pitchHz: row.pitchHz,
     reviewMode: row.reviewMode,
     mixOriginal: row.mixOriginal,
+    voiceMatch: row.voiceMatch,
     segmentCount: row.segmentCount,
     error: row.error,
     log: opts.withLog === false ? [] : (row.log ?? []),

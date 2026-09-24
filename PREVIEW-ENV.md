@@ -70,6 +70,39 @@ allowedDevOrigins: ["*.e2b.app", "*.arena.ai", "*.host-ai.app", "localhost", "12
 Fonts are self-hosted from the `@fontsource*` packages (`src/app/layout.tsx` uses
 `next/font/local`) because `fonts.googleapis.com` is unreachable.
 
+## Dubbing offline in this sandbox
+
+Only the npm and PyPI registries are reachable here, so the three neural stages
+of the pipeline have offline paths:
+
+| Stage | Online engine | Offline engine (used here) |
+| --- | --- | --- |
+| Speech recognition | Faster-Whisper (downloads from HF) | model installed from the **Studio** → runs locally |
+| Translation | Groq / OpenAI / MyMemory (server) | the visitor's browser (CORS-enabled MT API) or manual edits in review |
+| Voice | Edge-TTS neural voice | Piper voice if installed, else bundled espeak-ng |
+| Voice cloning | — | `scripts/voice_profile.py` + `scripts/offline_tts.py` match the dub's pitch and tone to the speaker in the source video |
+
+**Bring your own model.** `GET /api/models` lists presets (Whisper tiny/base/small,
+Piper Hindi voices). The browser downloads those files from Hugging Face and
+streams them into `data/models` with `POST /api/models/upload`
+(headers `x-rel-path` + `x-offset`, raw chunk body, 8 MB chunks). Everything
+afterwards runs locally: `src/lib/models.ts` finds the installed model and the
+pipeline uses it automatically.
+
+Flow states: `awaiting_transcript` (no Whisper yet — the Studio offers the
+one-click install, then `PATCH {action:"transcribe"}`) and `awaiting_review`
+(lines need translating — the Studio can translate them in the browser, then
+`PATCH {action:"continue"}`).
+
+`scripts/voice_profile.py` reports the speaker's median F0 and band energies;
+`scripts/offline_tts.py` shifts the TTS voice onto that pitch and EQ curve
+(`VOICEMATCH` line on stderr). Example: source speaker 88.4 Hz male,
+raw espeak Hindi 210 Hz female → matched dub 97 Hz male.
+
+FFmpeg: the `@ffmpeg-installer/ffmpeg` build is from 2018 and lacks
+`amix=normalize`, so ffmpeg 7.0.2 is taken from the PyPI `imageio-ffmpeg` wheel
+(`/home/user/bin/ffmpeg`), with `FFPROBE_PATH` pointing at the installer build.
+
 ## Sandbox network limits
 
 Only the npm registry and PyPI (plus github.com HTML) are reachable. Blocked:

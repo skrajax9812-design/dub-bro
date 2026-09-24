@@ -151,6 +151,7 @@ export async function POST(req: NextRequest) {
         : "auto",
       reviewMode: fields.reviewMode === "1",
       mixOriginal: fields.mixOriginal === "1",
+      voiceMatch: fields.voiceMatch !== "0",
     })
     .returning();
 

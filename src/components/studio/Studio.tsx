@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowLeft,
+  Wand2,
   ArrowRight,
   AudioWaveform,
   CheckCircle2,
@@ -27,21 +28,29 @@ import {
   Kicker,
   LogPanel,
   ReviewEditor,
+  ModelSetup,
   SettingsPanel,
   StageTracker,
   TranscriptPreview,
   type DubSettings,
 } from "./panels";
+import {
+  installPreset,
+  translateSegmentsInBrowser,
+  type ModelPresetInfo,
+  type PresetProgress,
+} from "@/lib/browserAssist";
 
 /* ------------------------------------------------------------------ */
 
-type Phase = "idle" | "ready" | "uploading" | "processing" | "review" | "done" | "error";
+type Phase = "idle" | "ready" | "uploading" | "processing" | "setup" | "review" | "done" | "error";
 
 function phaseOf(job: JobDto | null, file: File | null, uploading: boolean): Phase {
   if (uploading) return "uploading";
   if (!job) return file ? "ready" : "idle";
   if (job.status === "done") return "done";
   if (job.status === "error") return "error";
+  if (job.status === "awaiting_transcript") return "setup";
   if (job.status === "awaiting_review") return "review";
   return "processing";
 }
@@ -50,6 +59,7 @@ function StatusChip({ status }: { status: JobStatus }) {
   const map: Record<JobStatus, { cls: string; label: string }> = {
     queued: { cls: "border-white/15 text-zinc-300 bg-white/5", label: "QUEUED" },
     running: { cls: "border-neon/40 text-neon bg-neon/10", label: "RUNNING" },
+    awaiting_transcript: { cls: "border-warm/40 text-warm bg-warm/10", label: "NEEDS MODEL" },
     awaiting_review: { cls: "border-warm/40 text-warm bg-warm/10", label: "REVIEW" },
     done: { cls: "border-mint/40 text-mint bg-mint/10", label: "COMPLETE" },
     error: { cls: "border-red-400/40 text-red-300 bg-red-400/10", label: "FAILED" },
@@ -85,6 +95,7 @@ export function Studio() {
     pitch: 0,
     reviewMode: false,
     mixOriginal: false,
+    voiceMatch: true,
   });
   const [job, setJob] = useState<JobDto | null>(null);
   const [segments, setSegments] = useState<SegmentDto[]>([]);
@@ -94,6 +105,13 @@ export function Studio() {
   const [recents, setRecents] = useState<JobDto[]>([]);
   const [dirty, setDirty] = useState<Map<string, string>>(new Map());
   const [continuing, setContinuing] = useState(false);
+  const [presets, setPresets] = useState<ModelPresetInfo[]>([]);
+  const [installingId, setInstallingId] = useState<string | null>(null);
+  const [installLabel, setInstallLabel] = useState<string | null>(null);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+  const [askingTranscribe, setAskingTranscribe] = useState(false);
+  const [translating, setTranslating] = useState(false);
+  const [transLabel, setTransLabel] = useState<string | null>(null);
   const reviewVideoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -145,6 +163,95 @@ export function Studio() {
     return () => clearInterval(t);
   }, [job, fetchJob]);
 
+  /* ---------------- browser-assisted setup & translation ---------------- */
+
+  const loadModels = useCallback(async () => {
+    try {
+      const r = await fetch("/api/models");
+      const d = await r.json();
+      setPresets(d.presets ?? []);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (job?.status === "awaiting_transcript") void loadModels();
+  }, [job?.status, loadModels]);
+
+  async function installModel(preset: ModelPresetInfo) {
+    setInstallingId(preset.id);
+    setModelsError(null);
+    try {
+      await installPreset(preset, (p: PresetProgress) => {
+        const mb = (n: number) => (n / 1048576).toFixed(1);
+        setInstallLabel(`${p.fileLabel} — ${mb(p.received)} / ${mb(p.total)} MB`);
+      });
+      await loadModels();
+    } catch (e) {
+      setModelsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setInstallingId(null);
+      setInstallLabel(null);
+    }
+  }
+
+  async function resumeTranscribe() {
+    if (!job) return;
+    setAskingTranscribe(true);
+    setModelsError(null);
+    try {
+      const r = await fetch(`/api/jobs/${job.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "transcribe" }),
+      });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? "Could not start transcription");
+      await fetchJob(job.id);
+    } catch (e) {
+      setModelsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAskingTranscribe(false);
+    }
+  }
+
+  const needsTranslation =
+    segments.length > 0 &&
+    (job?.sourceLang ?? "auto") !== job?.targetLang &&
+    segments.some((s) => !s.translatedText || s.translatedText.trim() === s.sourceText.trim());
+
+  async function translateInBrowser() {
+    if (!job) return;
+    setTranslating(true);
+    setUiError(null);
+    try {
+      const src = (job.detectedLang || job.sourceLang || "en").slice(0, 2);
+      const map = await translateSegmentsInBrowser(
+        segments.map((s) => ({ id: s.id, sourceText: s.sourceText })),
+        src,
+        job.targetLang,
+        (done, total) => setTransLabel(`TRANSLATING ${done}/${total}`),
+      );
+      if (map.size > 0) {
+        await fetch(`/api/jobs/${job.id}`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            segments: [...map].map(([id, translatedText]) => ({ id, translatedText })),
+          }),
+        });
+      } else {
+        setUiError("The translation service could not be reached from your browser either.");
+      }
+      await fetchJob(job.id);
+    } catch (e) {
+      setUiError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setTranslating(false);
+      setTransLabel(null);
+    }
+  }
+
   /* actions */
   async function startDub() {
     if (!file) return;
@@ -159,6 +266,7 @@ export function Studio() {
       fd.append("pitchHz", String(settings.pitch));
       fd.append("reviewMode", settings.reviewMode ? "1" : "0");
       fd.append("mixOriginal", settings.mixOriginal ? "1" : "0");
+      fd.append("voiceMatch", settings.voiceMatch ? "1" : "0");
       fd.append("file", file, file.name); // file last for busboy ordering
 
       const r = await fetch("/api/jobs", { method: "POST", body: fd });
@@ -404,6 +512,47 @@ export function Studio() {
           </div>
         )}
 
+        {/* ------------------------- ENGINE SETUP ------------------------- */}
+        {phase === "setup" && job && (
+          <div>
+            <div className="mb-8 flex flex-wrap items-end justify-between gap-4">
+              <div>
+                <Kicker>[ ENGINE SETUP — {job.originalName.toUpperCase()} ]</Kicker>
+                <h1 className="mt-3 font-display text-4xl font-bold tracking-tight sm:text-5xl">
+                  One model, then it <span className="text-gradient">dubs</span>.
+                </h1>
+                <p className="mt-4 max-w-2xl text-[13.5px] leading-relaxed text-zinc-400">
+                  The audio is extracted and the voice profile is ready. Speech recognition needs a
+                  Whisper model, and this machine cannot download it — your browser can. Pick a size,
+                  install it once, and every future dub runs fully offline.
+                </p>
+              </div>
+              <div className="flex items-center gap-3 font-mono text-[10px] tracking-[0.18em] text-zinc-500">
+                <Clock3 className="h-3.5 w-3.5" />
+                {job.durationSec ? fmtTC(job.durationSec * 1000) : "PROBING…"} ·{" "}
+                {langName(job.targetLang).toUpperCase()}
+              </div>
+            </div>
+
+            <div className="grid items-start gap-6 lg:grid-cols-[1fr_22rem]">
+              <ModelSetup
+                presets={presets}
+                installedAsr={presets.find((p) => p.kind === "asr" && p.installed)?.id ?? null}
+                installing={installingId}
+                progressLabel={installLabel}
+                onInstall={(p) => void installModel(p)}
+                onContinue={() => void resumeTranscribe()}
+                busy={askingTranscribe || installingId !== null}
+                error={modelsError}
+              />
+              <div className="flex flex-col gap-5">
+                <StageTracker job={job} />
+                <LogPanel logs={job.log} />
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* ------------------------- PROCESSING ------------------------- */}
         {phase === "processing" && job && (
           <div>
@@ -473,6 +622,25 @@ export function Studio() {
                 <ArrowRight className="h-4 w-4" />
               </button>
             </div>
+
+            {needsTranslation && (
+              <div className="mb-6 flex flex-wrap items-center gap-4 rounded-2xl border border-warm/30 bg-warm/[0.06] px-5 py-4">
+                <Languages className="h-5 w-5 shrink-0 text-warm" />
+                <div className="min-w-0 flex-1 text-[13px] leading-relaxed text-zinc-300">
+                  These lines are still in the source language. This machine has no route to a
+                  translation API, but your browser does — translate them here, edit anything you
+                  like, then approve.
+                </div>
+                <button
+                  onClick={() => void translateInBrowser()}
+                  disabled={translating}
+                  className="flex items-center gap-2 rounded-xl border border-warm/40 bg-warm/[0.1] px-4 py-2 text-[12.5px] font-semibold text-warm transition hover:bg-warm/[0.18] disabled:opacity-40"
+                >
+                  {translating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wand2 className="h-3.5 w-3.5" />}
+                  {transLabel ?? "Translate in my browser"}
+                </button>
+              </div>
+            )}
 
             <div className="grid items-start gap-6 lg:grid-cols-[22rem_1fr]">
               <div className="glass sticky top-24 overflow-hidden rounded-3xl">

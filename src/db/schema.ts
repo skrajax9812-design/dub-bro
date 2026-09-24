@@ -26,7 +26,7 @@ export const dubJobs = pgTable(
       .defaultNow()
       .notNull(),
 
-    /** queued | running | awaiting_review | done | error */
+    /** queued | running | awaiting_transcript | awaiting_review | done | error */
     status: text("status").notNull().default("queued"),
     /** queued | extract | transcribe | translate | review | synthesize | sync | done | error */
     stage: text("stage").notNull().default("queued"),
@@ -51,6 +51,8 @@ export const dubJobs = pgTable(
     pitchHz: integer("pitch_hz").notNull().default(0),
     reviewMode: boolean("review_mode").notNull().default(false),
     mixOriginal: boolean("mix_original").notNull().default(false),
+    /** Clone the source speaker: pitch + tone matching of every dubbed line. */
+    voiceMatch: boolean("voice_match").notNull().default(true),
 
     segmentCount: integer("segment_count").notNull().default(0),
     error: text("error"),

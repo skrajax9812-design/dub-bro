@@ -3,7 +3,12 @@
 import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import {
+  AlertTriangle,
   Check,
+  Cpu,
+  Download,
+  Mic,
+  Wand2,
   FileVideo,
   Gauge,
   Globe2,
@@ -22,6 +27,7 @@ import {
 import type { JobDto, SegmentDto } from "@/lib/types";
 import { STAGE_META } from "@/lib/types";
 import { LANGUAGES, VOICES, voicesForLanguage, type DubVoice } from "@/lib/voices";
+import type { ModelPresetInfo } from "@/lib/browserAssist";
 
 /** Mirrors the extension allow-list enforced by /api/jobs. */
 const VIDEO_EXT = /\.(mp4|m4v|mov|mkv|webm|avi|mpg|mpeg|ts|m2ts|flv|wmv|3gp|mxf)$/i;
@@ -155,6 +161,7 @@ export interface DubSettings {
   pitch: number;
   reviewMode: boolean;
   mixOriginal: boolean;
+  voiceMatch: boolean;
 }
 
 function Field({ label, icon: Icon, children }: { label: string; icon: React.ElementType; children: React.ReactNode }) {
@@ -293,6 +300,13 @@ export function SettingsPanel({
           icon={Sparkles}
           title="Ambient mix"
           hint="Keep 10% original audio"
+        />
+        <Toggle
+          checked={settings.voiceMatch}
+          onChange={(v) => set({ voiceMatch: v })}
+          icon={ScanFace}
+          title="Voice match"
+          hint="Clone the speaker's pitch + tone"
         />
       </div>
     </div>
@@ -517,6 +531,107 @@ export function TranscriptPreview({ segments, langLabel }: { segments: SegmentDt
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Model setup — the browser installs the neural models               */
+/* ------------------------------------------------------------------ */
+
+export function ModelSetup({
+  presets,
+  installedAsr,
+  installing,
+  progressLabel,
+  onInstall,
+  onContinue,
+  busy,
+  error,
+}: {
+  presets: ModelPresetInfo[];
+  installedAsr: string | null;
+  installing: string | null;
+  progressLabel: string | null;
+  onInstall: (preset: ModelPresetInfo) => void;
+  onContinue: () => void;
+  busy: boolean;
+  error: string | null;
+}) {
+  const asr = presets.filter((p) => p.kind === "asr");
+  const tts = presets.filter((p) => p.kind === "tts");
+  const row = (p: ModelPresetInfo) => (
+    <div
+      key={p.id}
+      className={`flex flex-wrap items-center gap-3 rounded-2xl border p-4 transition ${
+        p.installed ? "border-mint/40 bg-mint/[0.06]" : "border-edge bg-ink/50"
+      }`}
+    >
+      <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-white/5">
+        {p.kind === "asr" ? <Mic className="h-4 w-4 text-neon" /> : <Volume2 className="h-4 w-4 text-warm" />}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="font-display text-[13.5px] font-semibold text-white">{p.label}</div>
+        <div className="mt-0.5 text-[11.5px] leading-snug text-zinc-500">{p.note}</div>
+        {installing === p.id && progressLabel && (
+          <div className="mt-2 font-mono text-[10px] tracking-[0.14em] text-neon">{progressLabel}</div>
+        )}
+      </div>
+      {p.installed ? (
+        <span className="flex items-center gap-1.5 rounded-full border border-mint/40 bg-mint/10 px-3 py-1 font-mono text-[9px] tracking-[0.18em] text-mint">
+          <Check className="h-3 w-3" /> INSTALLED
+        </span>
+      ) : (
+        <button
+          onClick={() => onInstall(p)}
+          disabled={busy}
+          className="flex items-center gap-2 rounded-xl border border-neon/40 bg-neon/[0.08] px-4 py-2 text-[12.5px] font-semibold text-neon transition hover:bg-neon/[0.16] disabled:opacity-40"
+        >
+          {installing === p.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+          Install via browser
+        </button>
+      )}
+    </div>
+  );
+
+  return (
+    <div className="glass flex flex-col gap-5 rounded-3xl p-6">
+      <div className="flex items-center justify-between">
+        <Kicker>[ ENGINE SETUP ]</Kicker>
+        <Cpu className="h-4 w-4 text-zinc-500" />
+      </div>
+      <p className="text-[13px] leading-relaxed text-zinc-400">
+        This machine can only reach the npm and PyPI registries, so it cannot download speech
+        models itself. <span className="text-zinc-200">Your browser can</span> — it fetches the
+        files below straight from Hugging Face and streams them into the studio, after which
+        everything runs locally, offline and watermark-free.
+      </p>
+      <div className="flex flex-col gap-2.5">
+        <div className="font-mono text-[9px] tracking-[0.25em] text-zinc-500">SPEECH RECOGNITION</div>
+        {asr.map(row)}
+      </div>
+      <div className="flex flex-col gap-2.5">
+        <div className="font-mono text-[9px] tracking-[0.25em] text-zinc-500">NEURAL VOICE (OPTIONAL, BETTER QUALITY)</div>
+        {tts.map(row)}
+      </div>
+      {error && (
+        <div className="flex items-start gap-3 rounded-2xl border border-red-400/30 bg-red-400/[0.07] px-4 py-3 text-[12.5px] text-red-200">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          {error}
+        </div>
+      )}
+      <button
+        onClick={onContinue}
+        disabled={!installedAsr || busy}
+        className="btn-primary glow-conic flex items-center justify-center gap-2.5 rounded-2xl px-6 py-3.5 font-display text-[15px] font-semibold text-white disabled:opacity-40"
+      >
+        {busy ? <Loader2 className="h-4.5 w-4.5 animate-spin" /> : <Wand2 className="h-4.5 w-4.5" />}
+        Transcribe &amp; continue
+      </button>
+      <p className="text-center font-mono text-[9px] tracking-[0.16em] text-zinc-600">
+        DOWNLOAD HAPPENS IN YOUR BROWSER · NOTHING LEAVES THIS MACHINE AFTERWARDS
+      </p>
     </div>
   );
 }

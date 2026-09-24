@@ -13,7 +13,61 @@ import {
 } from "@/lib/fftools";
 import { jobDir } from "@/lib/storage";
 import { defaultVoiceFor, voiceById } from "@/lib/voices";
+import { findLocalPiperVoice, findLocalWhisperModel } from "@/lib/models";
 import { translateAll } from "./translate";
+
+/* ------------------------------------------------------------------ */
+/* Engine availability                                                 */
+/* ------------------------------------------------------------------ */
+
+let edgeReachable: Promise<boolean> | null = null;
+
+/**
+ * Reachability probe. A bare TCP connect is not trustworthy here — filtered
+ * networks happily accept the handshake and only then drop the request — so we
+ * request a real URL and require an HTTP response.
+ */
+function httpReachable(url: string, timeoutMs = 5000): Promise<boolean> {
+  return fetch(url, { method: "GET", signal: AbortSignal.timeout(timeoutMs) })
+    .then((r) => r.status > 0)
+    .catch(() => false);
+}
+
+/** Can this process reach the Edge-TTS endpoint? (Blocked in the sandbox.) */
+function canReachEdgeTts(): Promise<boolean> {
+  edgeReachable ??= httpReachable("https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list");
+  return edgeReachable;
+}
+
+let hfReachable: Promise<boolean> | null = null;
+
+/** Can this process reach huggingface.co (i.e. may Faster-Whisper download)? */
+function canReachHf(): Promise<boolean> {
+  hfReachable ??= httpReachable("https://huggingface.co/api/models?limit=1");
+  return hfReachable;
+}
+
+type TtsEngine = "edge" | "piper" | "offline";
+
+/**
+ * auto  -> online neural voice when reachable, else Piper, else the built-in
+ *          espeak-ng fallback (always works, even with zero internet).
+ */
+async function resolveTtsEngine(job: JobRow): Promise<TtsEngine> {
+  const forced = (process.env.TTS_ENGINE ?? "auto").toLowerCase();
+  const gender = voiceById(job.voiceId)?.gender ?? "M";
+  const piper = findLocalPiperVoice(job.targetLang, gender);
+  if (forced === "edge") return "edge";
+  if (forced === "offline") return piper ? "piper" : "offline";
+  if (forced === "piper") return piper ? "piper" : "offline";
+  if (await canReachEdgeTts()) return "edge";
+  return piper ? "piper" : "offline";
+}
+
+export function activeEngineLabel(): string {
+  const forced = (process.env.TTS_ENGINE ?? "auto").toLowerCase();
+  return forced === "auto" ? "auto-detect" : forced;
+}
 
 type JobRow = typeof dubJobs.$inferSelect;
 type SegmentRow = typeof dubSegments.$inferSelect;
@@ -144,24 +198,76 @@ async function stageExtract(job: JobRow, dir: string) {
 
   await setJob(job.id, { webPath, audioPath, durationSec: duration });
   await addLog(job.id, `Extraction complete — normalized WAV ready for ASR.`);
+
+  // Offline speaker analysis — drives voice matching at synthesis time.
+  if (job.voiceMatch) {
+    const profilePath = path.join(dir, "voice_profile.json");
+    try {
+      const res = await run(
+        PY,
+        [path.join(SCRIPTS, "voice_profile.py"), "--audio", audioPath, "--out", profilePath],
+        { killAfterMs: 15 * 60_000 },
+      );
+      if (res.code === 0) {
+        const prof = JSON.parse(res.stdout.trim() || "{}") as {
+          f0Median?: number;
+          genderHint?: string;
+        };
+        await addLog(
+          job.id,
+          `Voice profile — ${prof.f0Median ?? "?"} Hz (${prof.genderHint ?? "unknown"}). The dub will be matched to this voice.`,
+        );
+      }
+    } catch {
+      await addLog(job.id, "Voice profile skipped — analysis failed, synthesizing with the raw voice.");
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ */
 /* Stage 2 — Faster-Whisper ASR (INT8, CPU), chunked for any length    */
 /* ------------------------------------------------------------------ */
 
-async function stageTranscribe(job: JobRow, dir: string) {
+async function stageTranscribe(job: JobRow, dir: string): Promise<"ok" | "awaiting"> {
   await setProgress(job.id, "transcribe", 8, "Splitting audio into ASR chunks…");
+
+  // A transcript that the browser already produced (it has internet, the
+  // sandbox does not) is used as-is.
+  const supplied = await getSegments(job.id);
+  if (supplied.length > 0) {
+    await addLog(job.id, `Transcript supplied by the Studio — ${supplied.length} lines in hand.`);
+    await setProgress(job.id, "transcribe", 38, `${supplied.length} lines ready`);
+    return "ok";
+  }
+
   // Clean retry residue
   await db.delete(dubSegments).where(eq(dubSegments.jobId, job.id));
 
+  const localModel = findLocalWhisperModel();
+  if (!localModel && !(await canReachHf())) {
+    await addLog(
+      job.id,
+      "Whisper model not installed and huggingface.co is unreachable from the server. Open the Studio — your browser downloads the model (one click) and the transcript comes from there.",
+    );
+    await setJob(job.id, {
+      status: "awaiting_transcript",
+      stage: "transcribe",
+      progress: 8,
+      stageDetail: "Speech-to-text model missing — install it from the Studio",
+      error: null,
+    });
+    return "awaiting";
+  }
+  const modelRef = localModel ?? WHISPER_MODEL;
+
   const duration = job.durationSec ?? (await probeDurationSec(job.audioPath!));
   const chunkCount = Math.max(1, Math.ceil(duration / CHUNK_SEC));
-  await addLog(job.id, `Faster-Whisper (${WHISPER_MODEL}, INT8, CPU) · ${chunkCount} chunk(s) of ${CHUNK_SEC / 60} min`);
+  await addLog(job.id, `Faster-Whisper (${modelRef}, INT8, CPU) · ${chunkCount} chunk(s) of ${CHUNK_SEC / 60} min`);
 
   type RawSeg = { start: number; end: number; text: string };
   const all: RawSeg[] = [];
   let detected: string | null = null;
+  let failedChunks = 0;
 
   for (let c = 0; c < chunkCount; c++) {
     const offsetSec = c * CHUNK_SEC;
@@ -180,12 +286,13 @@ async function stageTranscribe(job: JobRow, dir: string) {
       [
         path.join(SCRIPTS, "transcribe.py"),
         "--audio", chunkPath,
-        "--model", WHISPER_MODEL,
+        "--model", modelRef,
         "--lang", job.sourceLang || "auto",
       ],
       { killAfterMs: 4 * 60 * 60_000 },
     );
     if (res.code !== 0) {
+      failedChunks++;
       await addLog(job.id, `ASR chunk ${c + 1} failed (${res.stderr.slice(-160)}) — skipping`);
       continue;
     }
@@ -193,6 +300,7 @@ async function stageTranscribe(job: JobRow, dir: string) {
     try {
       parsed = JSON.parse(res.stdout.trim());
     } catch {
+      failedChunks++;
       await addLog(job.id, `ASR chunk ${c + 1}: unparseable output — skipping`);
       continue;
     }
@@ -220,6 +328,21 @@ async function stageTranscribe(job: JobRow, dir: string) {
     if (s.end - s.start < 0.25) continue;
     if (s.start >= duration - 0.1) continue;
     merged.push({ start: s.start, end: Math.min(s.end, duration), text: s.text });
+  }
+
+  if (merged.length === 0 && failedChunks >= chunkCount) {
+    // Every chunk failed — that is an engine problem, not a silent video.
+    await addLog(
+      job.id,
+      "Speech recognition could not run: no local Whisper model and no route to huggingface.co. Install a model from the Studio — your browser fetches it.",
+    );
+    await setJob(job.id, {
+      status: "awaiting_transcript",
+      stage: "transcribe",
+      progress: 8,
+      stageDetail: "Speech-to-text model missing — install it from the Studio",
+    });
+    return "awaiting";
   }
 
   if (merged.length === 0) {
@@ -250,6 +373,7 @@ async function stageTranscribe(job: JobRow, dir: string) {
     job.id,
     `ASR complete: ${merged.length} utterances · detected language: ${(detected ?? "unknown").toUpperCase()}`,
   );
+  return "ok";
 }
 
 /* ------------------------------------------------------------------ */
@@ -271,7 +395,17 @@ async function stageTranslate(job: JobRow) {
     return;
   }
 
-  const texts = segs.map((s) => s.sourceText);
+  // Lines that the Studio (or a human) already translated are left untouched.
+  const pending = segs.filter(
+    (s) => !s.translatedText || s.translatedText.trim() === s.sourceText.trim(),
+  );
+  if (pending.length === 0) {
+    await addLog(job.id, "Translations already supplied by the Studio — skipping the translation stage.");
+    await setProgress(job.id, "translate", 55, "Translation already supplied");
+    return;
+  }
+
+  const texts = pending.map((s) => s.sourceText);
   const { viaLLM } = await translateAll(
     texts,
     src,
@@ -280,13 +414,32 @@ async function stageTranslate(job: JobRow) {
       await db
         .update(dubSegments)
         .set({ translatedText: translated, status: "translated" })
-        .where(eq(dubSegments.id, segs[i].id));
+        .where(eq(dubSegments.id, pending[i].id));
     },
     (done, total) => {
       const pct = 38 + (done / Math.max(1, total)) * 17;
       void setProgress(job.id, "translate", pct, `Translating… ${done}/${total}`);
     },
   );
+  const after = await getSegments(job.id);
+  const realTranslations = after.filter(
+    (s) => s.translatedText && s.translatedText.trim() !== s.sourceText.trim(),
+  ).length;
+  if (realTranslations === 0) {
+    // Server-side providers are all unreachable (sandbox) — hand the job to the
+    // Studio, whose browser *can* reach a translation service.
+    await addLog(
+      job.id,
+      "No translation API reachable from the server. The Studio can translate these lines in your browser — do that, then press Synthesize.",
+    );
+    await setJob(job.id, {
+      status: "awaiting_review",
+      stage: "review",
+      progress: 55,
+      stageDetail: "Waiting for translation — the Studio fills this in from your browser",
+    });
+    return;
+  }
   await addLog(job.id, `Translation complete via ${viaLLM ? "LLM (chunked, context-aware)" : "MyMemory neural MT"}.`);
   await setProgress(job.id, "translate", 55, "Translation complete");
 }
@@ -306,16 +459,39 @@ async function stageSynthesize(job: JobRow, dir: string) {
 
   let voiceId = job.voiceId;
   if (!voiceById(voiceId)) voiceId = defaultVoiceFor(job.targetLang);
+  const voice = voiceById(voiceId);
   const rate = fmtSigned(job.ratePct, "%");
   const pitch = fmtSigned(job.pitchHz, "Hz");
-  await setProgress(job.id, "synthesize", 56, `Neural TTS: ${voiceId} (${segs.length} lines)`);
-  await addLog(job.id, `Edge-TTS voice ${voiceId} · rate ${rate} · pitch ${pitch}`);
+
+  const engine = await resolveTtsEngine(job);
+  const piperModel =
+    engine === "piper" ? findLocalPiperVoice(job.targetLang, voice?.gender ?? "M") : null;
+  const profilePath = path.join(dir, "voice_profile.json");
+  const hasProfile = job.voiceMatch && fs.existsSync(profilePath);
+
+  const engineLabel =
+    engine === "edge"
+      ? `Edge neural voice ${voiceId}`
+      : engine === "piper"
+        ? `Piper neural voice ${piperModel ? path.basename(piperModel) : job.targetLang}`
+        : `built-in offline voice (${job.targetLang}, ${voice?.gender === "F" ? "female" : "male"})`;
+
+  await setProgress(job.id, "synthesize", 56, `TTS: ${engineLabel} — ${segs.length} lines`);
+  await addLog(
+    job.id,
+    `TTS engine — ${engineLabel} · rate ${rate} · pitch ${pitch}${hasProfile ? " · voice-matched to the source speaker" : ""}`,
+  );
+  if (engine !== "edge" && !hasProfile) {
+    await addLog(job.id, "Voice matching unavailable for this job — synthesizing with the raw voice timbre.");
+  }
 
   const items = segs
     .map((s) => ({
       i: s.idx,
       text: (s.translatedText ?? s.sourceText).trim(),
       voice: voiceId,
+      lang: job.targetLang,
+      gender: voice?.gender ?? "M",
       rate,
       pitch,
       out: path.join(segDir, `seg_${s.idx}.mp3`),
@@ -327,13 +503,18 @@ async function stageSynthesize(job: JobRow, dir: string) {
 
   let doneCount = 0;
   const okIdx = new Set<number>();
+  const ttsArgs =
+    engine === "edge"
+      ? [path.join(SCRIPTS, "tts_batch.py"), "--manifest", manifest, "--concurrency", "5"]
+      : [
+          path.join(SCRIPTS, "offline_tts.py"),
+          "--manifest", manifest,
+          ...(hasProfile ? ["--profile", profilePath] : []),
+          ...(piperModel ? ["--piper-model", piperModel] : []),
+        ];
   const res = await run(
     PY,
-    [
-      path.join(SCRIPTS, "tts_batch.py"),
-      "--manifest", manifest,
-      "--concurrency", "5",
-    ],
+    ttsArgs,
     {
       killAfterMs: items.length * 8000 + 10 * 60_000,
       onLine: (line) => {
@@ -350,7 +531,12 @@ async function stageSynthesize(job: JobRow, dir: string) {
     },
   );
   if (res.code !== 0) throw new Error(`TTS worker crashed: ${res.stderr.slice(-300)}`);
-  if (okIdx.size === 0) throw new Error("Neural TTS produced no audio (network blocked?)");
+  if (okIdx.size === 0)
+    throw new Error(
+      engine === "edge"
+        ? "Edge TTS produced no audio (network blocked?)"
+        : "The offline TTS engine produced no audio.",
+    );
 
   // Per-segment duration probe + tempo alignment
   await addLog(job.id, `Synthesized ${okIdx.size}/${items.length} segments — aligning tempo…`);
@@ -486,27 +672,48 @@ async function stageMux(job: JobRow, dir: string) {
 /* Orchestrator                                                        */
 /* ------------------------------------------------------------------ */
 
-export async function runPipeline(jobId: string, opts: { fromReview?: boolean } = {}) {
+export type JobMode = "full" | "transcribe" | "review" | "resume";
+
+export async function runPipeline(jobId: string, opts: { mode?: JobMode } = {}) {
+  const mode: JobMode = opts.mode ?? "full";
   const dir = jobDir(jobId);
   try {
     await setJob(jobId, { status: "running", error: null });
     let job = await getJob(jobId);
 
-    if (!opts.fromReview) {
+    if (mode === "full") {
       await addLog(jobId, `Job accepted — "${job.originalName}" (${((job.fileSize ?? 0) / 1048576).toFixed(1)} MB)`);
       await stageExtract(job, dir);
       job = await getJob(jobId);
-      await stageTranscribe(job, dir);
+
+      const asr = await stageTranscribe(job, dir);
+      if (asr === "awaiting") return; // parked until the Studio supplies a transcript
       job = await getJob(jobId);
+
       await stageTranslate(job);
+      job = await getJob(jobId);
+      if (job.status === "awaiting_review") {
+        if (job.reviewMode) await addLog(jobId, "Waiting for human review — edit any line, then press Synthesize.");
+        return; // parked for browser translation / human review
+      }
 
       if (job.reviewMode) {
         await setJob(jobId, { status: "awaiting_review", stage: "review", progress: 55 });
         await addLog(jobId, "Waiting for human review — edit any line, then press Synthesize.");
         return;
       }
+    } else if (mode === "transcribe") {
+      await addLog(jobId, "Speech recognition model is in place — transcribing now.");
+      const asr = await stageTranscribe(job, dir);
+      if (asr === "awaiting") return;
+      job = await getJob(jobId);
+      await stageTranslate(job);
+      job = await getJob(jobId);
+      if (job.status === "awaiting_review" || job.reviewMode) return;
+    } else if (mode === "review") {
+      await addLog(jobId, "Review approved — starting synthesis…");
     } else {
-      await addLog(jobId, "Review approved — starting neural synthesis…");
+      await addLog(jobId, "Resuming with the transcript + translations supplied by the Studio…");
     }
 
     job = await getJob(jobId);

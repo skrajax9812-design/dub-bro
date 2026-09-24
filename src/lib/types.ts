@@ -1,4 +1,10 @@
-export type JobStatus = "queued" | "running" | "awaiting_review" | "done" | "error";
+export type JobStatus =
+  | "queued"
+  | "running"
+  | "awaiting_transcript"
+  | "awaiting_review"
+  | "done"
+  | "error";
 
 export type JobStage =
   | "queued"
@@ -41,6 +47,7 @@ export interface JobDto {
   pitchHz: number;
   reviewMode: boolean;
   mixOriginal: boolean;
+  voiceMatch: boolean;
   segmentCount: number;
   error: string | null;
   log: { t: number; msg: string }[];
