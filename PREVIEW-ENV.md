@@ -3,6 +3,37 @@
 Notes on how this checkout is wired up to run inside the sandbox, plus what is
 known to work there.
 
+## Auto-pilot ("tu hi install kar de")
+
+`/studio` ships with **Auto-pilot ON** (header pill). Once it is on, the page never
+needs a second click:
+
+1. **Install** — every model in `AUTO_ORDER` (whisper-base → xtts-v2 → whisper-small →
+   kokoro-hi → piper-hi-male) is fetched by the *browser* (Hugging Face allows CORS;
+   the sandbox itself cannot reach it) and written into `data/models/…` through
+   `/api/models/upload`, 8 MB at a time. Interrupted downloads resume from the byte
+   offset already on disk (`Range:` header + per-file `haveBytes` from `/api/models`).
+   Only the 1.9 GB XTTS download asks for confirmation, once; declining is remembered.
+2. **Resume** — as soon as any ASR model exists, a job parked at `awaiting_transcript`
+   is re-queued automatically (`action: transcribe`), so the video runs itself.
+3. **Translate** — at the review gate the Studio translates every line by itself: with
+   the user's AI key when one is stored (`dubforge.aiKey`), else the free MyMemory
+   endpoint, from the browser (the sandbox has no internet).
+4. **Approve** — because translations exist, review is skipped automatically and
+   synthesis starts.
+5. **Re-dub with the clone** — if the first render used espeak/Piper/Kokoro because the
+   1.9 GB XTTS model was still downloading, the finished job is re-synthesised once the
+   clone lands (`PATCH /api/jobs/:id {action:"redub"}` → `enqueueJob(id, "review")`).
+   The button "Re-dub with my cloned voice" on the done screen does the same by hand.
+
+The status strip under the header always shows what auto-pilot is doing right now.
+
+## Preview origin
+
+`https://3000-<sandbox-id>.e2b.app` — the sandbox id changes whenever the E2B box is
+recreated, so read the port-3000 preview link from the Arena UI rather than reusing an
+old URL. The server must be started with `-H 0.0.0.0` for the proxy to reach it.
+
 ## Rebuilding after a sandbox reset
 
 Everything below is reproducible:

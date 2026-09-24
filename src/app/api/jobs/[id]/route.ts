@@ -36,6 +36,7 @@ export async function GET(_req: NextRequest, { params }: Ctx) {
  *  { segments: [{id, translatedText}] }   -> save review edits
  *  { action: "continue" }                 -> leave review, synthesize
  *  { action: "retry" }                    -> rerun whole pipeline after error
+ *  { action: "redub" }                    -> re-synthesise a finished dub (e.g. with the clone)
  */
 export async function PATCH(req: NextRequest, { params }: Ctx) {
   const { id } = await params;
@@ -64,6 +65,29 @@ export async function PATCH(req: NextRequest, { params }: Ctx) {
     await db
       .update(dubJobs)
       .set({ status: "queued", stage: "synthesize", updatedAt: new Date() })
+      .where(eq(dubJobs.id, id));
+    enqueueJob(id, "review");
+    return NextResponse.json({ ok: true });
+  }
+
+  if (body.action === "redub") {
+    if (job.status !== "done") {
+      return NextResponse.json({ error: "Only a finished dub can be re-synthesised" }, { status: 409 });
+    }
+    const segs = await db.select().from(dubSegments).where(eq(dubSegments.jobId, id));
+    if (segs.length === 0) {
+      return NextResponse.json({ error: "This job has no transcript to re-synthesise" }, { status: 409 });
+    }
+    await db
+      .update(dubJobs)
+      .set({
+        status: "queued",
+        stage: "synthesize",
+        progress: 55,
+        error: null,
+        stageDetail: "Re-dubbing with the cloned voice",
+        updatedAt: new Date(),
+      })
       .where(eq(dubJobs.id, id));
     enqueueJob(id, "review");
     return NextResponse.json({ ok: true });

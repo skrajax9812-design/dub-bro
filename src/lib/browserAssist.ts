@@ -14,7 +14,10 @@ export interface ModelFileInfo {
   dest: string;
   repo: string;
   file: string;
-  bytes: number;
+  /** Bytes already streamed into the sandbox (used to resume). */
+  haveBytes: number;
+  /** Expected size of the finished file. */
+  totalBytes: number;
   complete: boolean;
 }
 
@@ -49,13 +52,23 @@ async function installFile(
   onProgress: (p: PresetProgress) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const res = await fetch(hfUrl(f.repo, f.file), { signal, mode: "cors", redirect: "follow" });
-  if (!res.ok) throw new Error(`${f.repo}/${f.file} → HTTP ${res.status}`);
+  // Resume an interrupted transfer instead of starting over.
+  const resumeAt = !f.complete && f.haveBytes > 0 && f.haveBytes < f.totalBytes ? f.haveBytes : 0;
+  const res = await fetch(hfUrl(f.repo, f.file), {
+    signal,
+    mode: "cors",
+    redirect: "follow",
+    headers: resumeAt > 0 ? { Range: `bytes=${resumeAt}-` } : undefined,
+  });
+  // A server that ignores Range answers 200 with the whole file: start over.
+  const resumed = res.status === 206 && resumeAt > 0;
+  if (!res.ok && res.status !== 206) throw new Error(`${f.repo}/${f.file} → HTTP ${res.status}`);
   if (!res.body) throw new Error("This browser cannot stream downloads.");
 
-  const total = Number(res.headers.get("content-length") ?? f.bytes) || f.bytes;
+  const remaining = Number(res.headers.get("content-length") ?? 0);
+  const total = resumed && remaining > 0 ? resumeAt + remaining : remaining || f.totalBytes;
   const reader = res.body.getReader();
-  let offset = 0;
+  let offset = resumed ? resumeAt : 0;
   let pending: Uint8Array[] = [];
   let pendingBytes = 0;
 
@@ -80,6 +93,7 @@ async function installFile(
     onProgress({ presetId, fileIndex, fileLabel: f.file, received: offset, total });
   };
 
+  onProgress({ presetId, fileIndex, fileLabel: f.file, received: offset, total });
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -93,7 +107,7 @@ async function installFile(
   await flush();
 }
 
-/** Install a whole preset (all of its files). */
+/** Install a whole preset (all of its files), resuming anything half-done. */
 export async function installPreset(
   preset: ModelPresetInfo,
   onProgress: (p: PresetProgress) => void,
@@ -104,6 +118,11 @@ export async function installPreset(
     if (f.complete) continue;
     await installFile(f, preset.id, i, onProgress, signal);
   }
+}
+
+/** Bytes still to fetch for a preset. */
+export function presetRemainingBytes(p: ModelPresetInfo): number {
+  return p.files.reduce((sum, f) => sum + Math.max(0, f.totalBytes - f.haveBytes), 0);
 }
 
 /* ------------------------------------------------------------------ */

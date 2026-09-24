@@ -21,10 +21,21 @@ export async function GET() {
   const xtts = findLocalXtts();
   return NextResponse.json({
     root: modelsRoot(),
-    presets: MODEL_PRESETS.map((p) => ({
-      ...presetStatus(p),
-      files: p.files.map((f, i) => ({ ...presetStatus(p).files[i], repo: f.repo, file: f.file, approx: f.bytes })),
-    })),
+    presets: MODEL_PRESETS.map((p) => {
+      const status = presetStatus(p);
+      return {
+        ...status,
+        // Byte counts per file so the browser can resume an interrupted download.
+        files: p.files.map((f, i) => ({
+          dest: f.dest,
+          repo: f.repo,
+          file: f.file,
+          haveBytes: status.files[i].bytes,
+          totalBytes: f.bytes,
+          complete: status.files[i].complete,
+        })),
+      };
+    }),
     active: {
       whisper: whisperDir ? whisperDir.split("/").pop() : null,
       piper: piperHi ? piperHi.split("/").pop() : null,

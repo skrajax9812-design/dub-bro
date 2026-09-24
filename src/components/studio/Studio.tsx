@@ -36,6 +36,7 @@ import {
 } from "./panels";
 import {
   installPreset,
+  presetRemainingBytes,
   PROVIDERS,
   translateSegmentsInBrowser,
   translateWithAi,
@@ -118,6 +119,13 @@ export function Studio() {
   const [testAudioUrl, setTestAudioUrl] = useState<string | null>(null);
   const [aiProvider, setAiProvider] = useState<Provider>("groq");
   const [aiKey, setAiKey] = useState("");
+  /** "You install it for me": models download themselves, jobs resume themselves. */
+  const [autoPilot, setAutoPilot] = useState(true);
+  const [autoNote, setAutoNote] = useState<string | null>(null);
+  const installingRef = useRef<string | null>(null);
+  const autoTranslatedRef = useRef<Set<string>>(new Set());
+  const declinedRef = useRef<Set<string>>(new Set());
+  const reDubRef = useRef<Set<string>>(new Set());
   const [askingTranscribe, setAskingTranscribe] = useState(false);
   const [translating, setTranslating] = useState(false);
   const [transLabel, setTransLabel] = useState<string | null>(null);
@@ -198,22 +206,133 @@ export function Studio() {
     }
   }, []);
 
-  async function installModel(preset: ModelPresetInfo) {
+  async function installModel(preset: ModelPresetInfo, silent = false) {
+    if (installingRef.current === preset.id) return;
+    installingRef.current = preset.id;
     setInstallingId(preset.id);
     setModelsError(null);
     try {
       await installPreset(preset, (p: PresetProgress) => {
         const mb = (n: number) => (n / 1048576).toFixed(1);
-        setInstallLabel(`${p.fileLabel} — ${mb(p.received)} / ${mb(p.total)} MB`);
+        const pct = p.total > 0 ? Math.round((p.received / p.total) * 100) : 0;
+        setInstallLabel(`${p.fileLabel} — ${mb(p.received)} / ${mb(p.total)} MB (${pct}%)`);
       });
       await loadModels();
     } catch (e) {
-      setModelsError(e instanceof Error ? e.message : String(e));
+      // An interrupted download is fine — the next tick resumes it where it stopped.
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!silent || !/abort|network|Failed to fetch/i.test(msg)) setModelsError(msg);
     } finally {
+      installingRef.current = null;
       setInstallingId(null);
       setInstallLabel(null);
     }
   }
+
+  /* ------------------------------------------------------------------ */
+  /* Auto-pilot: fetch the models itself, then let the job run to the end */
+  /* ------------------------------------------------------------------ */
+
+  const AUTO_ORDER = ["whisper-base", "xtts-v2", "whisper-small", "kokoro-hi", "piper-hi-male"];
+
+  useEffect(() => {
+    if (!autoPilot || installingId || presets.length === 0) return;
+    const missing = presets
+      .filter((p) => !p.installed && AUTO_ORDER.includes(p.id) && !declinedRef.current.has(p.id))
+      .sort((a, b) => AUTO_ORDER.indexOf(a.id) - AUTO_ORDER.indexOf(b.id));
+    const next = missing[0];
+    if (!next) return;
+    // A 1.9 GB pull behind someone's back would be rude on a metered link.
+    const gb = presetRemainingBytes(next) / 1024 ** 3;
+    if (gb > 0.5) {
+      const ok =
+        typeof window !== "undefined" &&
+        window.confirm(
+          `${next.label}\n\nOne-time download of about ${gb.toFixed(1)} GB, fetched by your browser ` +
+            `into this machine. After that every dub runs offline. Continue?`,
+        );
+      if (!ok) {
+        declinedRef.current.add(next.id);
+        setAutoNote(`${next.label} skipped — install it from the engine screen if you want it.`);
+        return;
+      }
+    }
+    void installModel(next, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoPilot, presets, installingId]);
+
+  // The moment a transcript model exists, unpark the job that is waiting for it.
+  useEffect(() => {
+    if (!autoPilot || installingId || !job || askingTranscribe) return;
+    if (job.status !== "awaiting_transcript") return;
+    if (!presets.some((p) => p.kind === "asr" && p.installed)) return;
+    void resumeTranscribe();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoPilot, presets, job?.status, installingId]);
+
+  // Translate as soon as the job reaches the review gate.
+  useEffect(() => {
+    if (!autoPilot || !job || translating) return;
+    if (job.status !== "awaiting_review") return;
+    if (autoTranslatedRef.current.has(job.id)) return;
+    const untranslated = segments.filter(
+      (s) => !s.translatedText || s.translatedText.trim() === s.sourceText.trim(),
+    );
+    if (untranslated.length === 0) return;
+    autoTranslatedRef.current.add(job.id);
+    setAutoNote(
+      aiKey.trim()
+        ? "Translating every line with your AI key…"
+        : "Translating every line (free MyMemory)…",
+    );
+    void (async () => {
+      try {
+        if (aiKey.trim()) await translateWithKey();
+        else await translateInBrowser();
+        setAutoNote("Translation done — starting the voice work automatically.");
+      } catch (e) {
+        setAutoNote(
+          `Auto-translate hit a problem (${e instanceof Error ? e.message : String(e)}). ` +
+            "Press Translate in the review panel — nothing is lost.",
+        );
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoPilot, job?.status, segments.length, translating]);
+
+  // Then approve, so synthesis starts without anyone pressing a button.
+  useEffect(() => {
+    if (!autoPilot || !job || continuing || translating) return;
+    if (job.status !== "awaiting_review" || job.reviewMode) return;
+    if (!autoTranslatedRef.current.has(job.id) || segments.length === 0) return;
+    const stillUntranslated = segments.some(
+      (s) => !s.translatedText || s.translatedText.trim() === s.sourceText.trim(),
+    );
+    if (stillUntranslated) return;
+    void saveAndContinue();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoPilot, job?.status, segments, translating, continuing]);
+
+  // If the dub finished before the 1.9 GB clone arrived, re-render it with the clone.
+  useEffect(() => {
+    if (!autoPilot || !job) return;
+    if (job.status !== "done") return;
+    if (installingId) return;
+    if (!presets.some((p) => p.id === "xtts-v2" && p.installed)) return;
+    if (reDubRef.current.has(job.id)) return;
+    const usedClone = job.log.some((l) => /TTS engine — XTTS/i.test(l.msg));
+    const past = reDubRef.current.has(`checked:${job.id}`);
+    if (usedClone) {
+      reDubRef.current.add(`checked:${job.id}`);
+      return;
+    }
+    if (past) return;
+    reDubRef.current.add(`checked:${job.id}`);
+    reDubRef.current.add(job.id);
+    setAutoNote("Clone voice is ready — re-rendering this dub with your cloned voice…");
+    void redubWithClone();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoPilot, job?.status, job?.log.length, presets, installingId]);
 
   async function runSelfTest(kind: "tts" | "asr") {
     setTesting(kind);
@@ -422,6 +541,17 @@ export function Studio() {
     }
   }
 
+  /** Re-run synthesis on a finished dub — used when the voice clone lands late. */
+  async function redubWithClone() {
+    if (!job) return;
+    await fetch(`/api/jobs/${job.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "redub" }),
+    });
+    await fetchJob(job.id);
+  }
+
   async function retryJob() {
     if (!job) return;
     await fetch(`/api/jobs/${job.id}`, {
@@ -438,6 +568,7 @@ export function Studio() {
   }
 
   function resetAll() {
+    setAutoNote(null);
     setJob(null);
     setSegments([]);
     setFile(null);
@@ -487,6 +618,18 @@ export function Studio() {
             </div>
           </div>
           <div className="flex items-center gap-3">
+            <button
+              onClick={() => setAutoPilot((v) => !v)}
+              title="Download the speech models automatically and let the dub continue on its own"
+              className={`flex items-center gap-2 rounded-full border px-3.5 py-1.5 font-mono text-[9px] tracking-[0.18em] transition ${
+                autoPilot
+                  ? "border-mint/40 bg-mint/10 text-mint"
+                  : "border-white/15 text-zinc-500 hover:text-zinc-300"
+              }`}
+            >
+              <Wand2 className="h-3 w-3" />
+              AUTO-PILOT {autoPilot ? "ON" : "OFF"}
+            </button>
             {job && <StatusChip status={job.status} />}
             {(phase === "done" || phase === "error") && (
               <button
@@ -499,6 +642,29 @@ export function Studio() {
           </div>
         </div>
       </header>
+
+      {(installingId || autoNote) && (
+        <div className="relative z-10 border-b border-white/[0.06] bg-neon/[0.05]">
+          <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-3 px-5 py-2.5 sm:px-8">
+            {installingId ? (
+              <>
+                <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-neon" />
+                <span className="font-mono text-[10px] tracking-[0.16em] text-neon">
+                  AUTO-INSTALLING {(presets.find((p) => p.id === installingId)?.label ?? "").toUpperCase()}
+                </span>
+                <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-zinc-400">
+                  {installLabel ?? "starting…"}
+                </span>
+                <span className="hidden font-mono text-[9px] tracking-[0.14em] text-zinc-500 sm:inline">
+                  FETCHED BY YOUR BROWSER · KEEP THIS TAB OPEN
+                </span>
+              </>
+            ) : (
+              <span className="font-mono text-[10px] tracking-[0.14em] text-warm">{autoNote}</span>
+            )}
+          </div>
+        </div>
+      )}
 
       <main className="relative z-10 mx-auto w-full max-w-7xl flex-1 px-5 py-10 sm:px-8">
         {/* ------------------------- IDLE / READY ------------------------- */}
@@ -811,12 +977,23 @@ export function Studio() {
                   It speaks <span className="text-gradient">{langName(job.targetLang)}</span> now.
                 </h1>
               </div>
-              <a
-                href={`/api/jobs/${job.id}/file?kind=output&download=1`}
-                className="btn-primary glow-conic flex items-center gap-2.5 rounded-2xl px-7 py-3.5 font-display text-[15px] font-semibold text-white"
-              >
-                <Download className="h-4.5 w-4.5" /> Download MP4
-              </a>
+              <div className="flex flex-wrap items-center gap-3">
+                {presets.some((p) => p.id === "xtts-v2" && p.installed) &&
+                  !job.log.some((l) => /TTS engine — XTTS/i.test(l.msg)) && (
+                    <button
+                      onClick={() => void redubWithClone()}
+                      className="flex items-center gap-2 rounded-2xl border border-mint/35 bg-mint/10 px-5 py-3 font-display text-[13px] font-semibold text-mint transition hover:bg-mint/20"
+                    >
+                      <Wand2 className="h-4 w-4" /> Re-dub with my cloned voice
+                    </button>
+                  )}
+                <a
+                  href={`/api/jobs/${job.id}/file?kind=output&download=1`}
+                  className="btn-primary glow-conic flex items-center gap-2.5 rounded-2xl px-7 py-3.5 font-display text-[15px] font-semibold text-white"
+                >
+                  <Download className="h-4.5 w-4.5" /> Download MP4
+                </a>
+              </div>
             </div>
 
             <div className="mb-6 flex gap-3">
