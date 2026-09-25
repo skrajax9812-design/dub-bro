@@ -2,20 +2,52 @@
 # Rebuilds the whole DUBFORGE runtime inside an Arena sandbox.
 # Idempotent — safe to re-run after a sandbox reset.
 #
-#   bash scripts/setup-sandbox.sh
+#   bash scripts/setup-sandbox.sh          # rebuild everything
+#   bash scripts/start-sandbox.sh          # ensure + run the studio
 #
-# The sandbox can only reach the npm and PyPI registries, so ffmpeg comes from a
-# PyPI wheel and PostgreSQL from an npm package instead of the system packages.
+# IMPORTANT — why nothing heavy lives in the project folder:
+# the workspace (`/home/user`) is captured in a snapshot at the end of every
+# turn with a ~128 MB / 10k-file budget. A Python venv with torch (about 2 GB),
+# the Postgres cluster and the model weights blow that budget, and the snapshot
+# then comes back partial or empty — which is what kept wiping the runtime.
+# So every big artifact is created under $DUBFORGE_HOME (default /opt/dubforge,
+# outside the snapshot) and the app is pointed at it through .env.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORK=/home/user
 export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+
+# ---- pick a home for the heavy runtime, outside the workspace snapshot -----
+WORK="${DUBFORGE_HOME:-/opt/dubforge}"
+if ! mkdir -p "$WORK" 2>/dev/null || [ ! -w "$WORK" ]; then
+  sudo -n mkdir -p "$WORK" >/dev/null 2>&1 && sudo -n chown -R "$(id -un):$(id -gn)" "$WORK" >/dev/null 2>&1 || true
+fi
+if [ ! -w "$WORK" ]; then
+  echo "WARN: $WORK is not writable — falling back to /home/user (snapshots will be large)"
+  WORK=/home/user
+fi
+export DUBFORGE_HOME="$WORK"
 export PATH="$WORK/venv/bin:$PATH"
 
 say() { printf "\n\033[1;36m== %s\033[0m\n" "$*"; }
 
-say "1/7 Python venv + AI packages"
+# ---- keep the workspace itself tiny ---------------------------------------
+say "0/8 keeping the project folder small"
+cd "$ROOT"
+if [ "$WORK" != "/home/user/dub-bro" ] && [ -d "$ROOT/data" ]; then
+  # Move anything already downloaded (models/jobs) out of the snapshot budget.
+  mkdir -p "$WORK/data"
+  for sub in models jobs uploads; do
+    if [ -e "$ROOT/data/$sub" ] && [ ! -e "$WORK/data/$sub" ]; then mv "$ROOT/data/$sub" "$WORK/data/$sub"; fi
+  done
+fi
+if [ "$WORK" = "/opt/dubforge" ]; then
+  for legacy in "$ROOT/data" /home/user/venv /home/user/bin /home/user/pgdata /home/user/pgserver /home/user/pgpw.txt /home/user/pglog.txt; do
+    [ -e "$legacy" ] && rm -rf "$legacy" && echo "  cleared $legacy"
+  done
+fi
+
+say "1/8 Python venv + AI packages"
 if [ ! -x "$WORK/venv/bin/python" ]; then
   python3 -m venv "$WORK/venv" >/dev/null
 fi
@@ -31,7 +63,7 @@ fi
 "$WORK/venv/bin/pip" install --quiet --no-cache-dir "transformers>=4.57,<5" \
   || echo "  (transformers pin failed)"
 
-say "2/7 ffmpeg + ffprobe binaries"
+say "2/8 ffmpeg + ffprobe binaries"
 mkdir -p "$WORK/bin"
 FFMPEG_BIN="$("$WORK/venv/bin/python" -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')"
 cp -f "$FFMPEG_BIN" "$WORK/bin/ffmpeg"
@@ -48,11 +80,11 @@ fi
 "$WORK/bin/ffmpeg" -version | head -1
 "$WORK/bin/ffprobe" -version | head -1 || echo "  (ffprobe missing — ffmpeg-only mode)"
 
-say "3/7 Node dependencies"
+say "3/8 Node dependencies"
 cd "$ROOT"
 npm install --no-audit --no-fund --ignore-scripts >/dev/null 2>&1
 
-say "4/7 PostgreSQL (embedded-postgres binaries)"
+say "4/8 PostgreSQL (embedded-postgres binaries)"
 PGSRV="$WORK/pgserver"
 if [ ! -x "$PGSRV/node_modules/@embedded-postgres/linux-x64/native/bin/postgres" ]; then
   mkdir -p "$PGSRV" && cd "$PGSRV"
@@ -65,7 +97,7 @@ if [ ! -d "$WORK/pgdata" ]; then
   "$PGBIN/initdb" -D "$WORK/pgdata" -U postgres --pwfile="$WORK/pgpw.txt" -A trust --encoding=UTF8 >/dev/null
 fi
 
-say "5/7 start PostgreSQL + create app_db"
+say "5/8 start PostgreSQL + create app_db"
 if ! pgrep -f "postgres -D $WORK/pgdata" >/dev/null 2>&1; then
   nohup "$PGBIN/postgres" -D "$WORK/pgdata" -p 5432 -c listen_addresses=127.0.0.1 -k /tmp \
     > "$WORK/pglog.txt" 2>&1 &
@@ -83,21 +115,23 @@ const {Client}=require("pg");
   await c.end();
 })().catch(e=>{console.error("  DB error",e.message);process.exit(1)});'
 
-say "6/7 environment file + schema"
+say "6/8 environment file"
 cd "$ROOT"
 cat > .env <<EOF
 DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/app_db
 FFMPEG_PATH=$WORK/bin/ffmpeg
 FFPROBE_PATH=$WORK/bin/ffprobe
 PYTHON_BIN=$WORK/venv/bin/python
+# Models, uploads and job outputs live outside the workspace snapshot.
+DUB_DATA_DIR=$WORK/data
 TTS_ENGINE=auto
 EOF
+
+say "7/8 database schema"
 DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:5432/app_db" \
   npx drizzle-kit push --config=drizzle.config.json --force >/dev/null 2>&1 || \
   echo "  (drizzle push failed — retry after the server is up)"
 
-say "7/7 done — start the studio with:"
-cat <<EOF
-  cd $ROOT && export PATH=$WORK/venv/bin:\$PATH NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \\
-    && npm run dev -- -H 0.0.0.0 -p 3000
-EOF
+say "8/8 done — start the studio with:  bash scripts/start-sandbox.sh"
+du -sh "$WORK" 2>/dev/null | sed 's/^/  runtime: /'
+du -sh "$ROOT" --exclude=node_modules --exclude=.next --exclude=.git 2>/dev/null | sed 's/^/  project: /'

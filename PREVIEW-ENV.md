@@ -3,6 +3,34 @@
 Notes on how this checkout is wired up to run inside the sandbox, plus what is
 known to work there.
 
+## Where things live (important)
+
+The workspace (`/home/user`) is snapshotted at the end of every turn with a
+~128 MB / 10k-file budget. Anything bigger — the Python venv (torch makes it
+about 2 GB), the Postgres cluster, ffmpeg binaries, model weights, uploaded
+videos — lives under `$DUBFORGE_HOME` (default `/opt/dubforge`), which is
+outside that budget. `.env` points the app there:
+
+```
+PYTHON_BIN=/opt/dubforge/venv/bin/python
+FFMPEG_PATH=/opt/dubforge/bin/ffmpeg
+FFPROBE_PATH=/opt/dubforge/bin/ffprobe
+DUB_DATA_DIR=/opt/dubforge/data    # models + jobs + uploads
+```
+
+Keeping the project folder tiny is what lets the checkout survive a reset at
+all; the runtime itself is always rebuilt from npm + PyPI in a few minutes.
+
+## After a sandbox reset
+
+```bash
+cd /home/user/dub-bro
+git fetch origin 'refs/heads/*:refs/remotes/origin/*' && git reset --hard origin/arena/01a0d28f-dub-bro
+bash scripts/start-sandbox.sh        # rebuilds the runtime if missing, then serves :3000
+```
+
+`scripts/setup-sandbox.sh` is the rebuild on its own (idempotent).
+
 ## Auto-pilot ("tu hi install kar de")
 
 `/studio` ships with **Auto-pilot ON** (header pill). Once it is on, the page never
